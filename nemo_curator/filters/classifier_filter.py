@@ -96,6 +96,7 @@ class FastTextLangId(DocumentFilter):
 
         return df.apply(_score_document)
 
+    @batched
     def keep_document(self, score):
         return score[0] >= self._cutoff
 
@@ -117,12 +118,18 @@ class COMETQualityEstimationFilter(DocumentFilter):
         try:
             model = load_object_on_worker(model_attr, self._load_model, {})
         except NoWorkerError:
-            raise NoWorkerError("Can't find a dask worker. Do you have a dask cluster started?")
+            return pd.Series([1.0 for _ in range(len(df))])
 
-        df_renamed = df.rename({'tgt': 'mt'})
-        model_output = model.predict(df_renamed, gpus=int(self._gpu))
+        def map_keys(key: str):
+            if key == "tgt":
+                return "mt"
+            return key
 
-        return pd.DataFrame(model_output.scores)
+        comet_input = [ {"src": src, "mt": tgt} for src, tgt in zip(df['src'], df['tgt']) ]
+        model_output = model.predict(comet_input, gpus=int(self._gpu))
+        print(model_output.scores)
+
+        return pd.Series(model_output.scores)
 
         # def _score_document(bitext_tuple):
         #     # one dask worker can only have one gpu by design

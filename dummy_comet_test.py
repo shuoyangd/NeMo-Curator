@@ -1,3 +1,5 @@
+import pdb
+
 from nemo_curator.modules.filter import JointScoreFilter
 from nemo_curator.filters import COMETQualityEstimationFilter
 from nemo_curator.utils.distributed_utils import get_client
@@ -17,7 +19,10 @@ if __name__ == '__main__':
         ]
     )
 
-    client = get_client(n_workers=1, rmm_pool_size=None)
+    client = get_client(n_workers=2, rmm_pool_size=None, cluster_type="gpu")
     filter_ = JointScoreFilter(COMETQualityEstimationFilter())
     filtered_data = filter_(dataset)
+
+    filtered_data.df.compute()
+    print(filtered_data)
     client.close()
