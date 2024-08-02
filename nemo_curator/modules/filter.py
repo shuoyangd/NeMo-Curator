@@ -185,6 +185,7 @@ class JointScoreFilter:
         if self.invert:
             bool_mask = ~bool_mask
 
+
         return DocumentDataset(dataset.df[bool_mask])
 
 
