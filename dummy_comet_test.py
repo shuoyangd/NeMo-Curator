@@ -20,9 +20,8 @@ if __name__ == '__main__':
     )
 
     client = get_client(n_workers=2, rmm_pool_size=None, cluster_type="gpu")
-    filter_ = JointScoreFilter(COMETQualityEstimationFilter())
+    filter_ = JointScoreFilter(COMETQualityEstimationFilter(gpu=True), score_type=float)
     filtered_data = filter_(dataset)
 
-    filtered_data.df.compute()
-    print(filtered_data)
+    print(filtered_data.df.compute())
     client.close()

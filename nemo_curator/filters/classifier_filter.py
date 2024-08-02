@@ -117,14 +117,15 @@ class COMETQualityEstimationFilter(DocumentFilter):
         try:
             model = load_object_on_worker(model_attr, self._load_model, {})
         except NoWorkerError:
-            return pd.Series([1.0 for _ in range(len(df))])
+            return pd.Series([-1.0 for _ in range(len(df))])
 
         comet_input = [ {"src": src, "mt": tgt} for src, tgt in zip(df['src'], df['tgt']) ]
-        model_output = model.predict(comet_input, gpus=int(self._gpu))
+        model_output = model.predict(comet_input, gpus=int(self._gpu), num_workers=0)
 
-        return pd.Series(model_output.scores).reindex(df.index, fill_value=False)
+        return pd.Series(model_output.scores, index=df.index)
 
     def keep_document(self, score):
+        print(f"this sentence has score {score}")
         return score >= self._cutoff
 
     def _load_model(self):
