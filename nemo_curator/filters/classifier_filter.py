@@ -16,7 +16,9 @@ import dask
 import fasttext
 import numpy as np
 import pandas as pd
+import pdb
 
+from comet import download_model, load_from_checkpoint
 from nemo_curator.filters.doc_filter import DocumentFilter
 from nemo_curator.utils.decorators import batched
 from nemo_curator.utils.distributed_utils import NoWorkerError, load_object_on_worker
@@ -99,3 +101,41 @@ class FastTextLangId(DocumentFilter):
 
     def _load_model(self):
         return fasttext.load_model(self._model_path)
+
+
+class COMETQualityEstimationFilter(DocumentFilter):
+
+    def __init__(self, cutoff=-0.25, gpu=False):
+        self._name = "comet_qe"
+        self._model_path = download_model("Unbabel/wmt20-comet-qe-da")
+        self._cutoff = cutoff
+        self._gpu = gpu
+
+    @batched
+    def score_document(self, df: pd.Series):
+        model_attr = f"{self._name}_{self._model_path}"
+        try:
+            model = load_object_on_worker(model_attr, self._load_model, {})
+        except NoWorkerError:
+            raise NoWorkerError("Can't find a dask worker. Do you have a dask cluster started?")
+
+        df_renamed = df.rename({'tgt': 'mt'})
+        model_output = model.predict(df_renamed, gpus=int(self._gpu))
+
+        return pd.DataFrame(model_output.scores)
+
+        # def _score_document(bitext_tuple):
+        #     # one dask worker can only have one gpu by design
+        #     if self._gpu:
+        #         model_output = self.model.predict([{"src": bitext_tuple['src'], "mt": bitext_tuple['tgt']}], gpus=1)
+        #     else:
+        #         model_output = self.model.predict([{"src": bitext_tuple['src'], "mt": bitext_tuple['tgt']}], gpus=0)
+        #     return pd.DataFrame(model_output.scores)
+
+        # return df.apply(_score_document)
+
+    def keep_document(self, score):
+        return score >= self._cutoff
+
+    def _load_model(self):
+        return load_from_checkpoint(self._model_path)
