@@ -96,7 +96,6 @@ class FastTextLangId(DocumentFilter):
 
         return df.apply(_score_document)
 
-    @batched
     def keep_document(self, score):
         return score[0] >= self._cutoff
 
@@ -120,26 +119,10 @@ class COMETQualityEstimationFilter(DocumentFilter):
         except NoWorkerError:
             return pd.Series([1.0 for _ in range(len(df))])
 
-        def map_keys(key: str):
-            if key == "tgt":
-                return "mt"
-            return key
-
         comet_input = [ {"src": src, "mt": tgt} for src, tgt in zip(df['src'], df['tgt']) ]
         model_output = model.predict(comet_input, gpus=int(self._gpu))
-        print(model_output.scores)
 
-        return pd.Series(model_output.scores)
-
-        # def _score_document(bitext_tuple):
-        #     # one dask worker can only have one gpu by design
-        #     if self._gpu:
-        #         model_output = self.model.predict([{"src": bitext_tuple['src'], "mt": bitext_tuple['tgt']}], gpus=1)
-        #     else:
-        #         model_output = self.model.predict([{"src": bitext_tuple['src'], "mt": bitext_tuple['tgt']}], gpus=0)
-        #     return pd.DataFrame(model_output.scores)
-
-        # return df.apply(_score_document)
+        return pd.Series(model_output.scores).reindex(df.index, fill_value=False)
 
     def keep_document(self, score):
         return score >= self._cutoff
