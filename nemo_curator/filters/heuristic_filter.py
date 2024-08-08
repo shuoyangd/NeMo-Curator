@@ -642,6 +642,9 @@ class PornographicUrlsFilter(DocumentFilter):
 class HistogramFilter(DocumentFilter):
     """
     Histogram filter used by the NLLB paper (https://arxiv.org/pdf/2207.04672). See p30 for details.
+    
+    Written with reference to the original fairseq implementation at:
+    https://github.com/facebookresearch/fairseq/blob/main/examples/m2m_100/process_data/clean_histogram.py.
     """
 
     def __init__(self, lang="en", threshold=0.8, cache_dir="", threshold_char="]"):
