@@ -47,11 +47,12 @@ class DocumentDataset:
         files_per_partition: int = 1,
         add_filename: bool = False,
         input_meta: Union[str, dict] = None,
+        file_ext: str = "jsonl",
     ):
         return cls(
             _read_json_or_parquet(
                 input_files=input_files,
-                file_type="jsonl",
+                file_type=file_ext,
                 backend=backend,
                 files_per_partition=files_per_partition,
                 add_filename=add_filename,
@@ -66,11 +67,12 @@ class DocumentDataset:
         backend="pandas",
         files_per_partition=1,
         add_filename=False,
+        file_ext: str = "parquet",
     ):
         return cls(
             _read_json_or_parquet(
                 input_files=input_files,
-                file_type="parquet",
+                file_type=file_ext,
                 backend=backend,
                 files_per_partition=files_per_partition,
                 add_filename=add_filename,
@@ -84,11 +86,12 @@ class DocumentDataset:
         backend="pandas",
         files_per_partition=1,
         add_filename=False,
+        file_ext: str = "pickle",
     ):
         return cls(
             read_data(
                 input_files=input_files,
-                file_type="pickle",
+                file_type=file_ext,
                 backend=backend,
                 files_per_partition=files_per_partition,
                 add_filename=add_filename,
