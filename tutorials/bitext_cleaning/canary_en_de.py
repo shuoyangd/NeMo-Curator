@@ -13,11 +13,14 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
 import re
 import shutil
 from functools import partial
-from typing import Any, List
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Any, List, Optional, Tuple
 
 import yaml
 
@@ -34,11 +37,16 @@ from nemo_curator.utils.script_utils import ArgumentHelper
 
 # SRC_FILE="/data/train.old_plus_paracrawl_and_cwmt.dedup.shuf.lengthratio.shufagain.detok.en"
 # TGT_FILE="/data/train.old_plus_paracrawl_and_cwmt.dedup.shuf.lengthratio.shufagain.detok.zh"
-SRC_LANG = "de"
-TGT_LANG = "en"
 
 SCRIPT_DIR_PATH = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR_PATH, "data")
+TEMP_DIR = "/lustre/fsw/portfolios/convai/users/shuoyangd/.tmp"
+
+
+def peek_manifest_for_language(filename: str) -> Tuple[str]:
+    with open(filename) as fin:
+        dp_peek = json.loads(fin.readline())
+        return dp_peek["source_lang"], dp_peek["target_lang"]
 
 
 def expand_file_list(filename: str) -> List[str]:
@@ -56,26 +64,28 @@ def expand_file_list(filename: str) -> List[str]:
         return [filename]
 
 
-def filter_dataset(dataset: ParallelDataset, gpu: bool = False) -> ParallelDataset:
+def filter_dataset(
+    dataset: ParallelDataset, src_lang: str, tgt_lang: str, gpu: bool = False
+) -> ParallelDataset:
     filters = Sequential(
         [
             ParallelScoreFilter(
-                WordCountFilter(min_words=1, lang=SRC_LANG),  # filter out empty lines
-                WordCountFilter(min_words=1, lang=TGT_LANG),  # filter out empty lines
+                WordCountFilter(min_words=1, lang=src_lang),  # filter out empty lines
+                WordCountFilter(min_words=1, lang=tgt_lang),  # filter out empty lines
                 src_field="text",
                 tgt_field="answer",
                 score_type=int,
             ),
             JointScoreFilter(
-                LengthRatioFilter(max_ratio=9, src_lang=SRC_LANG, tgt_lang=TGT_LANG),
+                LengthRatioFilter(max_ratio=4, src_lang=src_lang, tgt_lang=tgt_lang),
                 score_field="length_ratio",
                 score_type=float,
                 src_field="text",
                 tgt_field="answer",
             ),
             ParallelScoreFilter(
-                HistogramFilter(lang=SRC_LANG),
-                HistogramFilter(lang=TGT_LANG),
+                HistogramFilter(lang=src_lang),
+                HistogramFilter(lang=tgt_lang),
                 src_score="src_hist",
                 tgt_score="tgt_hist",
                 src_field="text",
@@ -94,7 +104,9 @@ def filter_dataset(dataset: ParallelDataset, gpu: bool = False) -> ParallelDatas
     return filtered_dataset
 
 
-def run_curation_pipeline(args: Any, files: List[str]) -> None:
+def run_curation_pipeline(
+    args: Any, files: List[str], group_idx: Optional[int] = None
+) -> None:
     # Initialize the Dask cluster.
     client = get_client(**ArgumentHelper.parse_client_args(args))
 
@@ -104,14 +116,21 @@ def run_curation_pipeline(args: Any, files: List[str]) -> None:
         files,
         add_filename=True,
     )
+    src_lang, tgt_lang = peek_manifest_for_language(files[0])
+
+    print("Executing the pipeline...")
     curation_steps = Sequential(
         [
-            partial(filter_dataset, gpu=(args.device == "gpu")),
+            partial(
+                filter_dataset,
+                src_lang=src_lang,
+                tgt_lang=tgt_lang,
+                gpu=(args.device == "gpu"),
+            ),
         ]
     )
 
     dataset = curation_steps(bitext_dataset)
-    print("Executing the pipeline...")
     dataset = dataset.persist()
 
     print(f"Original dataset length: {len(bitext_dataset.df)}")
@@ -121,7 +140,10 @@ def run_curation_pipeline(args: Any, files: List[str]) -> None:
     # raise NotImplementedError("writing not finished yet, filters not checked")
 
     # Overwrite existing files in the curated directory.
-    out_path = os.path.join(DATA_DIR, "curated")
+    if group_idx is not None:
+        out_path = os.path.join(args.output, f"group{group_idx}")
+    else:
+        out_path = args.output
 
     if os.path.isdir(out_path):
         shutil.rmtree(out_path)
@@ -139,6 +161,13 @@ def main():
         type=str,
         required=True,
         help="yaml config for canary training",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        required=True,
+        help="output folder for curated data",
     )
     args = ArgumentHelper(parser).add_distributed_args().parse_args()
     # Limit the total number of workers to ensure we don't run out of memory.
@@ -161,11 +190,22 @@ def main():
     unexpanded_file_paths = [
         cfg["manifest_filepath"] for cfg in translation_input_config["input_cfg"]
     ]
-    file_paths = []
     for group_idx, unexpanded_file_path in enumerate(unexpanded_file_paths):
-        file_paths.extend(expand_file_list(unexpanded_file_path))
+        file_paths = []
+        with TemporaryDirectory(dir=TEMP_DIR) as tempdir:
+            for path in expand_file_list(unexpanded_file_path):
+                path = Path(path)
+                file_basename = path.stem + ".jsonl"
+                symlink = os.path.join(tempdir, file_basename)
+                os.symlink(path, symlink)
+                file_paths.append(symlink)
 
-    run_curation_pipeline(args, file_paths)
+            run_curation_pipeline(args, file_paths, group_idx)
+
+            with open(
+                os.path.join(args.output, f"group{group_idx}", "ORIG_PATH"), "w"
+            ) as f:
+                f.write(os.path.dirname(unexpanded_file_path) + os.linesep)
 
 
 if __name__ == "__main__":
