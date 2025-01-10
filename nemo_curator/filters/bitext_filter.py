@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Union
 from dask.typing import no_default
 
 from nemo_curator.datasets.parallel_dataset import ParallelDataset
-from nemo_curator.utils.module_utils import is_batched
+from nemo_curator.utils.module_utils import SKIP_LABEL_KEY, is_batched
 
 
 class BitextFilter(ABC):
@@ -41,6 +41,7 @@ class BitextFilter(ABC):
         score_field: Optional[str] = None,
         score_type: Union[type, str] = None,
         invert=False,
+        add_skip_label_only: bool = False,
     ):
         """Args:
             src_field (str, optional): The field the source documents will be read from. Defaults to "src".
@@ -64,6 +65,7 @@ class BitextFilter(ABC):
         self.score_field = score_field
         self.score_type = score_type
         self.invert = invert
+        self.add_skip_label_only = add_skip_label_only
 
     def __call__(
         self,
@@ -113,7 +115,15 @@ class BitextFilter(ABC):
         if self.invert:
             bool_mask = ~bool_mask
 
-        return ParallelDataset(dataset.df[bool_mask])
+        if self.add_skip_label_only:
+            if SKIP_LABEL_KEY not in dataset.df.columns:
+                dataset.df[SKIP_LABEL_KEY] = ""
+            dataset.df[SKIP_LABEL_KEY] = dataset.df[SKIP_LABEL_KEY].where(
+                bool_mask, self.__class__.__name__
+            )  # `where` sets value when the mask is false
+            return ParallelDataset(dataset.df)
+        else:
+            return ParallelDataset(dataset.df[bool_mask])
 
     def _score_bitext_wrapper(
         self,
