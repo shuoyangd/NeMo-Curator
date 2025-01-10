@@ -22,7 +22,7 @@ from dask.typing import no_default
 from nemo_curator.datasets import DocumentDataset
 from nemo_curator.datasets.parallel_dataset import ParallelDataset
 from nemo_curator.filters import DocumentFilter
-from nemo_curator.utils.module_utils import is_batched
+from nemo_curator.utils.module_utils import SKIP_LABEL_KEY, is_batched
 
 # Override so that pd.NA is not passed during the metadata inference
 make_array_nonempty.register(
@@ -165,6 +165,7 @@ class ScoreFilter:
         score_field: Optional[str] = None,
         score_type: Union[type, str] = None,
         invert: bool = False,
+        add_skip_label_only: bool = False,
     ):
         """
         Constructs a ScoreFilter module.
@@ -181,6 +182,7 @@ class ScoreFilter:
         self.score_field = score_field
         self.score_type = score_type
         self.invert = invert
+        self.add_skip_label_only = add_skip_label_only
 
     def compute_filter_mask(self, dataset: DocumentDataset):
         """Compute the bool mask to filter the dataset.
@@ -230,7 +232,16 @@ class ScoreFilter:
             DocumentDataset: A dataset with the score and filter applied
         """
         bool_mask = self.compute_filter_mask(dataset)
-        return DocumentDataset(dataset.df[bool_mask])
+
+        if self.add_skip_label_only:
+            if SKIP_LABEL_KEY not in dataset.df.columns:
+                dataset.df[SKIP_LABEL_KEY] = ""
+            dataset.df[SKIP_LABEL_KEY] = dataset.df[SKIP_LABEL_KEY].where(
+                bool_mask, self.filter_obj.__class__.__name__
+            )  # `where` sets value when the mask is false
+            return DocumentDataset(dataset.df)
+        else:
+            return DocumentDataset(dataset.df[bool_mask])
 
 
 class ParallelScoreFilter:
@@ -244,6 +255,7 @@ class ParallelScoreFilter:
         tgt_score=None,
         score_type=None,
         invert=False,
+        add_skip_label_only: bool = False,
     ):
         """A filter object wrapper class for applying *monolingual* filter objects on bitext.
         If either side of the bitext is discarded, the whole bitext pair is discarded.
@@ -265,17 +277,33 @@ class ParallelScoreFilter:
         """
 
         self.source_score_filter = ScoreFilter(
-            src_filter_obj, src_field, src_score, score_type, invert
+            src_filter_obj,
+            src_field,
+            src_score,
+            score_type,
+            invert,
+            add_skip_label_only,
         )
         self.target_score_filter = ScoreFilter(
-            tgt_filter_obj, tgt_field, tgt_score, score_type, invert
+            tgt_filter_obj,
+            tgt_field,
+            tgt_score,
+            score_type,
+            invert,
+            add_skip_label_only,
         )
+        self.add_skip_label_only = add_skip_label_only
 
     def __call__(self, dataset: ParallelDataset):
-        src_bool_mask = self.source_score_filter.compute_filter_mask(dataset)
-        tgt_bool_mask = self.target_score_filter.compute_filter_mask(dataset)
-
         # remove lines together if one of them is filtered
-        bool_mask = logical_and(src_bool_mask, tgt_bool_mask)
+        if self.add_skip_label_only:
+            ds1 = self.source_score_filter.__call__(dataset)
+            # ds2 = self.target_score_filter(ds1)
+            return ds1
+        else:
+            src_bool_mask = self.source_score_filter.compute_filter_mask(dataset)
+            tgt_bool_mask = self.target_score_filter.compute_filter_mask(dataset)
 
-        return ParallelDataset(dataset.df[bool_mask])
+            bool_mask = logical_and(src_bool_mask, tgt_bool_mask)
+
+            return ParallelDataset(dataset.df[bool_mask])

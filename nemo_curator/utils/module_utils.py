@@ -13,6 +13,8 @@
 # limitations under the License.
 import math
 
+SKIP_LABEL_KEY = "_skipme"
+
 
 def is_batched(function):
     return hasattr(function, "batched") and function.batched

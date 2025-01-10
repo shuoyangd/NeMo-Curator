@@ -74,6 +74,7 @@ def filter_dataset(
                 src_field="text",
                 tgt_field="answer",
                 score_type=int,
+                add_skip_label_only=True,
             ),
             LengthRatioFilter(
                 max_ratio=4,
@@ -83,6 +84,7 @@ def filter_dataset(
                 score_type=float,
                 src_field="text",
                 tgt_field="answer",
+                add_skip_label_only=True,
             ),
             ParallelScoreFilter(
                 HistogramFilter(lang=src_lang),
@@ -92,6 +94,7 @@ def filter_dataset(
                 src_field="text",
                 tgt_field="answer",
                 score_type=int,
+                add_skip_label_only=True,
             ),
             ParallelScoreFilter(
                 FastTextLangId(model_path=FAST_TEXT_MODEL_DIR, lang=src_lang),
@@ -99,6 +102,7 @@ def filter_dataset(
                 src_field="text",
                 tgt_field="answer",
                 score_type=str,
+                add_skip_label_only=True,
             ),
             QualityEstimationFilter(
                 "cometoid-wmt23",
@@ -113,6 +117,7 @@ def filter_dataset(
                     "target_lang": "tgt_lang",
                 },
                 score_type=float,
+                add_skip_label_only=True,
             ),
         ]
     )
