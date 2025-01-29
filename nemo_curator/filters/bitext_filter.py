@@ -15,10 +15,16 @@
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Union
 
+from dask.array import logical_and
 from dask.typing import no_default
 
 from nemo_curator.datasets.parallel_dataset import ParallelDataset
-from nemo_curator.utils.module_utils import SKIP_LABEL_KEY, is_batched
+from nemo_curator.utils.module_utils import (
+    REASON_LABEL_KEY,
+    SKIP_LABEL_KEY,
+    UID_KEY,
+    is_batched,
+)
 
 
 class BitextFilter(ABC):
@@ -91,21 +97,43 @@ class BitextFilter(ABC):
         fields.append(self.tgt_field)
         fields.extend(self.metadata_fields)
 
+        if self.add_skip_label_only:
+            if SKIP_LABEL_KEY not in dataset.df.columns:
+                dataset.df[SKIP_LABEL_KEY] = 0
+                dataset.df[REASON_LABEL_KEY] = None
+
+            # although the full dataset is passed, we don't need to compute score on full data
+            # only data that's still remaining needs to be processed
+            kept_mask = dataset.df[SKIP_LABEL_KEY] == 0
+            df = dataset.df[kept_mask].copy()
+        else:
+            df = dataset.df
+
         if is_batched(self.score_bitext):
-            scores = dataset.df[fields].map_partitions(
+            scores = df[fields].map_partitions(
                 self._score_bitext_wrapper,
                 metadata_field_name_mapping=self.metadata_field_name_mapping,
                 meta=meta,
             )
         else:
-            scores = dataset.df[fields].apply(
+            scores = df[fields].apply(
                 self._score_bitext_wrapper,
                 metadata_field_name_mapping=self.metadata_field_name_mapping,
                 axis=1,
                 meta=meta,
             )
 
-        if self.score_field is not None:
+        if self.score_field is not None and self.add_skip_label_only:
+            dataset.df[self.score_field] = None
+
+            def update_score(partition, mask_partition, score_partition):
+                partition.loc[mask_partition, self.score_field] = score_partition
+                return partition
+
+            dataset.df = dataset.df.map_partitions(
+                update_score, kept_mask, scores, meta=dataset.df
+            )
+        elif self.score_field is not None:
             dataset.df[self.score_field] = scores
 
         if is_batched(self.keep_bitext):
@@ -115,12 +143,33 @@ class BitextFilter(ABC):
         if self.invert:
             bool_mask = ~bool_mask
 
+        def update_skipme(partition, kept_mask_partition, score_bool_mask_partition):
+            partition.loc[kept_mask_partition, SKIP_LABEL_KEY] = [
+                1 if skip else 0 for skip in ~score_bool_mask_partition
+            ]
+            return partition
+
+        def update_reason(partition, kept_mask_partition, reason):
+            # filtering reason needs to be updated for the following entries
+            # 1. the entry was kept before
+            # 2. the entry was thrown out by this filter
+            new_skip = [
+                True if skip == 1 else False for skip in partition[SKIP_LABEL_KEY]
+            ]
+            new_mask = logical_and(kept_mask_partition.values, new_skip)
+            partition.loc[new_mask, REASON_LABEL_KEY] = reason
+            return partition
+
         if self.add_skip_label_only:
-            if SKIP_LABEL_KEY not in dataset.df.columns:
-                dataset.df[SKIP_LABEL_KEY] = ""
-            dataset.df[SKIP_LABEL_KEY] = dataset.df[SKIP_LABEL_KEY].where(
-                bool_mask, self.__class__.__name__
-            )  # `where` sets value when the mask is false
+            dataset.df = dataset.df.map_partitions(
+                update_skipme,
+                kept_mask,
+                ~bool_mask if self.invert else bool_mask,
+                meta=dataset.df,
+            )
+            dataset.df = dataset.df.map_partitions(
+                update_reason, kept_mask, self.__class__.__name__, meta=dataset.df
+            )
             return ParallelDataset(dataset.df)
         else:
             return ParallelDataset(dataset.df[bool_mask])
