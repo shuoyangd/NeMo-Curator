@@ -19,12 +19,7 @@ from dask.array import logical_and
 from dask.typing import no_default
 
 from nemo_curator.datasets.parallel_dataset import ParallelDataset
-from nemo_curator.utils.module_utils import (
-    REASON_LABEL_KEY,
-    SKIP_LABEL_KEY,
-    UID_KEY,
-    is_batched,
-)
+from nemo_curator.utils.module_utils import REASON_LABEL_KEY, SKIP_LABEL_KEY, is_batched
 
 
 class BitextFilter(ABC):

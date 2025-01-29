@@ -22,12 +22,7 @@ from dask.typing import no_default
 from nemo_curator.datasets import DocumentDataset
 from nemo_curator.datasets.parallel_dataset import ParallelDataset
 from nemo_curator.filters import DocumentFilter
-from nemo_curator.utils.module_utils import (
-    REASON_LABEL_KEY,
-    SKIP_LABEL_KEY,
-    UID_KEY,
-    is_batched,
-)
+from nemo_curator.utils.module_utils import REASON_LABEL_KEY, SKIP_LABEL_KEY, is_batched
 
 # Override so that pd.NA is not passed during the metadata inference
 make_array_nonempty.register(
