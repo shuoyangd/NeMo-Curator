@@ -734,23 +734,23 @@ class HistogramFilter(DocumentFilter):
         """Load histogram files."""
 
         self._histogram = []
-        with open(
-            os.path.join(
-                self._cache_dir,
-                "histograms",
-                "checkpoint",
-                "edunov",
-                "cc60_multilingual",
-                "clean_hists",
-                self._lang,
-            )
-        ) as f:
-            for line in f:
-                c = line[0]
-                if c == self._threshold_char:
-                    break
-                self._histogram.append(c)
-        self._histogram = set(self._histogram)
+        histogram_path = os.path.join(
+            self._cache_dir,
+            "histograms",
+            "checkpoint",
+            "edunov",
+            "cc60_multilingual",
+            "clean_hists",
+            self._lang,
+        )
+        if os.path.exists(histogram_path):
+            with open(histogram_path) as f:
+                for line in f:
+                    c = line[0]
+                    if c == self._threshold_char:
+                        break
+                    self._histogram.append(c)
+            self._histogram = set(self._histogram)
 
     def score_document(self, text: str) -> float:
         """Compute histogram token ratio of a text data instance according to the loaded histogram.
@@ -761,11 +761,15 @@ class HistogramFilter(DocumentFilter):
         Returns:
             float: Ratio of tokens included in the histogram.
         """
+        # if histogram can't be loaded (e.g. langauge doesn't exist), don't filter anything
+        if not self._histogram:
+            return 1
+
         cnt = len([c for c in text.strip() if c in self._histogram])
-        return 1 if cnt / len(text) > self._threshold else 0
+        return cnt / len(text)
 
     def keep_document(self, score):
-        return score == 1
+        return score > self._threshold
 
 
 class LengthRatioFilter(BitextFilter):
