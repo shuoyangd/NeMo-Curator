@@ -201,6 +201,7 @@ class ScoreFilter:
         if self.add_skip_label_only:
             if SKIP_LABEL_KEY not in dataset.df.columns:
                 dataset.df[SKIP_LABEL_KEY] = 0
+            if REASON_LABEL_KEY not in dataset.df.columns:
                 dataset.df[REASON_LABEL_KEY] = None
 
             # although the full dataset is passed, we don't need to compute score on full data
