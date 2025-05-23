@@ -24,7 +24,7 @@ from typing import Any, List, Optional, Tuple
 
 import yaml
 
-from nemo_curator import ParallelScoreFilter, Sequential
+from nemo_curator import ParallelScoreFilter, ScoreFilter, Sequential
 from nemo_curator.datasets import ParallelDataset
 from nemo_curator.filters import (
     FastTextLangId,
@@ -33,6 +33,8 @@ from nemo_curator.filters import (
     QualityEstimationFilter,
     WordCountFilter,
 )
+from nemo_curator.modifiers import RegexModifier
+from nemo_curator.modules import Modify
 from nemo_curator.utils.distributed_utils import get_client
 from nemo_curator.utils.script_utils import ArgumentHelper
 
@@ -41,11 +43,50 @@ DATA_DIR = os.path.join(SCRIPT_DIR_PATH, "data")
 TEMP_DIR = ""
 FAST_TEXT_MODEL_DIR = ""
 
+REGEX_PARAMS_LIST = [
+    {"pattern": "’", "repl": "'"},
+    {"pattern": "‘", "repl": "'"},
+    {"pattern": "—", "repl": "-"},
+    {"pattern": "–", "repl": "-"},
+    {"pattern": "-", "repl": "-"},
+    {"pattern": "_", "repl": " "},
+    {"pattern": "——", "repl": "-"},
+    {"pattern": "Ё", "repl": "Е"},
+    {"pattern": "ё", "repl": "е"},
+    {"pattern": "♫", "repl": " "},
+    {"pattern": "♪", "repl": " "},
+    {"pattern": "♬", "repl": " "},
+    {"pattern": "♩", "repl": " "},
+    {"pattern": "♭", "repl": " "},
+    {"pattern": "\|", "repl": " "},
+    {"pattern": ";", "repl": ","},
+    {"pattern": "\[[^\]]*\]", "repl": ""},
+    {"pattern": " ?\([^\)]+\)", "repl": ""},
+    {"pattern": " ?{[^}]+}", "repl": ""},
+    {
+        "pattern": "[^ !$%',-.0123456789;?ABCDEFGHIJKLMNOPQRSßTUVWXYŸZabcdefghijklmnopqrsẞtuvwxyÿz¡£¿ÀÁÂÃÄÅÆÇÈÉÊÌÍÎÑÒÓÔÕÖØÙÚÜÝàáâãäåæçèéêëìíîïñòóôõöøùúûüýĀāĂăĄąĆćĊċČčĎďĐđĒēĖėĘęĚěĠġĢģĦħĪīĮįĶķĹĺĻļĽľŁłŃńŅņŇňŐőŒœŔŕŘřŚśŠšŤťŪūŮůŰűŲųŹźŻżŽžȘșȚțΆΈΉΌΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩάέήίαβγδεζηθικλμνξοπρστυφχψωϊόύώЁЄІЇАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяёєіїҐґ€₴₽/:]",
+        "repl": "",
+    },
+    {"pattern": "\s+\.", "repl": "."},
+    {"pattern": "\?+", "repl": "?"},
+    {"pattern": "\.+", "repl": "."},
+    {"pattern": ",+", "repl": ","},
+    {"pattern": "!+", "repl": "!"},
+    {"pattern": "\s+", "repl": " "},
+    {"pattern": " ([.,!?])", "repl": r"\1"},
+    # remove space before and after single quote
+    {"pattern": " '", "repl": "'"},
+    {"pattern": "' ", "repl": "'"},
+    {"pattern": "'+", "repl": "'"},
+    # remove spacing around hyphen
+    {"pattern": " - ", "repl": "-"},
+]
+
 
 def peek_manifest_for_language(filename: str) -> Tuple[str]:
     with open(filename) as fin:
         dp_peek = json.loads(fin.readline())
-        return dp_peek["source_lang"], dp_peek["target_lang"]
+        return dp_peek["source_lang"][:2], dp_peek["target_lang"][:2]
 
 
 def expand_file_list(filename: str) -> List[str]:
@@ -69,15 +110,15 @@ def filter_dataset(
     filters = Sequential(
         [
             ParallelScoreFilter(
-                WordCountFilter(min_words=1, lang=src_lang),  # filter out empty lines
-                WordCountFilter(min_words=1, lang=tgt_lang),  # filter out empty lines
+                WordCountFilter(min_words=4, lang=src_lang),  # filter out empty lines
+                WordCountFilter(min_words=4, lang=tgt_lang),  # filter out empty lines
                 src_field="text",
                 tgt_field="answer",
                 score_type=int,
                 add_skip_label_only=True,
             ),
             LengthRatioFilter(
-                max_ratio=4,
+                max_ratio=9,
                 src_lang=src_lang,
                 tgt_lang=tgt_lang,
                 score_field="length_ratio",
@@ -93,24 +134,23 @@ def filter_dataset(
                 tgt_score="tgt_hist",
                 src_field="text",
                 tgt_field="answer",
-                score_type=int,
+                score_type=float,
                 add_skip_label_only=True,
             ),
-            ParallelScoreFilter(
-                FastTextLangId(model_path=FAST_TEXT_MODEL_DIR, lang=src_lang),
+            ScoreFilter(
                 FastTextLangId(model_path=FAST_TEXT_MODEL_DIR, lang=tgt_lang),
-                src_field="text",
-                tgt_field="answer",
+                text_field="answer",
                 score_type=str,
                 add_skip_label_only=True,
             ),
             QualityEstimationFilter(
                 "cometoid-wmt23",
-                cutoff=0.75,
+                cutoff=0.6,
                 gpu=gpu,
                 mode="simple",
                 src_field="text",
                 tgt_field="answer",
+                score_field="qe",
                 metadata_fields=["source_lang", "target_lang"],
                 metadata_field_name_mapping={
                     "source_lang": "src_lang",
@@ -119,6 +159,10 @@ def filter_dataset(
                 score_type=float,
                 add_skip_label_only=True,
             ),
+            Modify(
+                RegexModifier(regex_params_list=REGEX_PARAMS_LIST),
+                text_field="answer",
+            ),
         ]
     )
     filtered_dataset = filters(dataset)
@@ -126,7 +170,9 @@ def filter_dataset(
 
 
 def run_curation_pipeline(
-    args: Any, files: List[str], group_idx: Optional[int] = None
+    args: Any,
+    files: List[str],
+    group_name: str = None,
 ) -> None:
     # Initialize the Dask cluster.
     client = get_client(**ArgumentHelper.parse_client_args(args))
@@ -161,8 +207,8 @@ def run_curation_pipeline(
     # raise NotImplementedError("writing not finished yet, filters not checked")
 
     # Overwrite existing files in the curated directory.
-    if group_idx is not None:
-        out_path = os.path.join(args.output, f"group{group_idx}")
+    if group_name is not None:
+        out_path = os.path.join(args.output, group_name)
     else:
         out_path = args.output
 
@@ -211,7 +257,7 @@ def main():
     unexpanded_file_paths = [
         cfg["manifest_filepath"] for cfg in translation_input_config["input_cfg"]
     ]
-    for group_idx, unexpanded_file_path in enumerate(unexpanded_file_paths):
+    for unexpanded_file_path in unexpanded_file_paths:
         file_paths = []
         with TemporaryDirectory(dir=TEMP_DIR) as tempdir:
             for path in expand_file_list(unexpanded_file_path):
@@ -221,11 +267,10 @@ def main():
                 os.symlink(path, symlink)
                 file_paths.append(symlink)
 
-            run_curation_pipeline(args, file_paths, group_idx)
+            group_name = Path(unexpanded_file_path).parent.name
+            run_curation_pipeline(args, file_paths, group_name)
 
-            with open(
-                os.path.join(args.output, f"group{group_idx}", "ORIG_PATH"), "w"
-            ) as f:
+            with open(os.path.join(args.output, group_name, "ORIG_PATH"), "w") as f:
                 f.write(os.path.dirname(unexpanded_file_path) + os.linesep)
 
 
