@@ -159,9 +159,4 @@ class PyMarianQEModel(QEModel):
                 self._model.evaluate(input[start_idx : start_idx + self.SHARD_SIZE])
             )
 
-        if not self._name.endswith("mqm"):
-            # using DA+SQM score by default
-            # choice made based on paper: https://aclanthology.org/2023.wmt-1.62.pdf
-            return [score[1] for score in scores]
-        else:
-            return [score[0] for score in scores]
+        return [score[0] for score in scores]

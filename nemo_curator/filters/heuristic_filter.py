@@ -15,6 +15,7 @@
 import os.path
 import tarfile
 
+import numpy as np
 import requests
 from platformdirs import user_cache_dir
 
@@ -803,7 +804,10 @@ class LengthRatioFilter(BitextFilter):
         """
         src_len = len(self._src_word_splitter(src.strip()))
         tgt_len = len(self._tgt_word_splitter(tgt.strip()))
-        return max(src_len / tgt_len, tgt_len / src_len)
+        if src_len == 0 or tgt_len == 0:
+            return np.inf
+        else:
+            return max(src_len / tgt_len, tgt_len / src_len)
 
     def keep_bitext(self, score):
         """Decides whether a single document should be retained according to the computed length ratio."""
