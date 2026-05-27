@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os.path
 import tarfile
+from pathlib import Path
 
 import requests
 from platformdirs import user_cache_dir
@@ -46,16 +46,21 @@ class HistogramFilter(DocumentFilter):
         threshold_char (str, optional): Formatter character of the histogram files. You should not change this unless you rebuilt your own histogram. Defaults to "]".
         """
         super().__init__()
-        self._lang = lang
-        self._threshold = threshold
-        self._cache_dir = cache_dir if cache_dir else user_cache_dir()
-        self._threshold_char = threshold_char
+        self._lang = lang or "en"
+        self._threshold = float(threshold) if threshold is not None else 0.8
+        self._cache_dir = Path(cache_dir if cache_dir else user_cache_dir())
+        self._threshold_char = threshold_char or "]"
+        self._histogram: set[str] = set()
         self._name = "histogram"
 
-        if not os.path.isdir(os.path.join(self._cache_dir, "histograms")):
+        if not self._histogram_root.exists():
             self._download_histograms()
 
         self._read_hist()
+
+    @property
+    def _histogram_root(self) -> Path:
+        return self._cache_dir / "histograms"
 
     def _download_histograms(self) -> None:
         """Download and process histograms from default repo.
@@ -73,12 +78,12 @@ class HistogramFilter(DocumentFilter):
             raise requests.exceptions.RequestException(msg)
 
         # Open a file to write the content
-        os.makedirs(self._cache_dir, exist_ok=True)
-        download_dest_path = os.path.join(self._cache_dir, "histograms.tar.gz")
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        download_dest_path = self._cache_dir / "histograms.tar.gz"
         with open(download_dest_path, "wb") as file:
             file.write(response.content)
 
-        extract_path = os.path.join(self._cache_dir, "histograms")
+        extract_path = self._histogram_root
         with tarfile.open(download_dest_path, "r:gz") as tar:
             # Extract all the contents into the specified directory
             tar.extractall(path=extract_path)  # noqa: S202
@@ -86,24 +91,27 @@ class HistogramFilter(DocumentFilter):
     def _read_hist(self) -> None:
         """Load histogram files."""
 
-        self._histogram = []
-        with open(
-            os.path.join(
-                self._cache_dir,
-                "histograms",
-                "checkpoint",
-                "edunov",
-                "cc60_multilingual",
-                "clean_hists",
-                self._lang,
-            )
-        ) as f:
+        histogram_chars = []
+        histogram_path = self._get_histogram_path()
+        if histogram_path is None:
+            return
+
+        with open(histogram_path, encoding="utf-8") as f:
             for line in f:
                 c = line[0]
                 if c == self._threshold_char:
                     break
-                self._histogram.append(c)
-        self._histogram = set(self._histogram)
+                histogram_chars.append(c)
+        self._histogram = set(histogram_chars)
+
+    def _get_histogram_path(self) -> Path | None:
+        candidates = [
+            # Useful for tests and user-provided local histograms.
+            self._histogram_root / self._lang,
+            # Layout produced by the M2M-100 histogram tarball.
+            self._histogram_root / "checkpoint" / "edunov" / "cc60_multilingual" / "clean_hists" / self._lang,
+        ]
+        return next((path for path in candidates if path.exists()), None)
 
     def score_document(self, text: str) -> float:
         """Compute histogram token ratio of a text data instance according to the loaded histogram.
@@ -114,8 +122,15 @@ class HistogramFilter(DocumentFilter):
         Returns:
             float: Ratio of tokens included in the histogram.
         """
-        cnt = len([c for c in text.strip() if c in self._histogram])
-        return 1 if cnt / len(text) > self._threshold else 0
+        if not self._histogram:
+            return 1.0
+
+        stripped_text = text.strip()
+        if not stripped_text:
+            return 0.0
+
+        cnt = len([c for c in stripped_text if c in self._histogram])
+        return cnt / len(stripped_text)
 
     def keep_document(self, score: float) -> bool:
-        return score == 1
+        return score > self._threshold
