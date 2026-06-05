@@ -30,12 +30,10 @@ __all__ = [
     "ALMDataOverlapStage",
     "AudioDataFilterStage",
     "BandFilterStage",
-    "DirectionalShardedWriterStage",
     "FastTextLIDStage",
     "FinalizeFieldsStage",
     "GetAudioDurationStage",
     "InitializeFieldsStage",
-    "LLMTranslationStage",
     "MonoConversionStage",
     "PreserveByValueStage",
     "RegexSubstitutionStage",
@@ -43,13 +41,9 @@ __all__ = [
     "SegmentConcatenationStage",
     "SpeakerSeparationStage",
     "TimestampMapperStage",
-    "TranslationExpanderStage",
-    "TranslationManifestReader",
-    "TranslationManifestReaderStage",
     "UTMOSFilterStage",
     "VADSegmentationStage",
     "WhisperHallucinationStage",
-    "all_shards_done",
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
@@ -71,12 +65,6 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "InitializeFieldsStage": ("nemo_curator.stages.audio.text_filtering", "InitializeFieldsStage"),
     "RegexSubstitutionStage": ("nemo_curator.stages.audio.text_filtering", "RegexSubstitutionStage"),
     "WhisperHallucinationStage": ("nemo_curator.stages.audio.text_filtering", "WhisperHallucinationStage"),
-    "DirectionalShardedWriterStage": ("nemo_curator.stages.audio.translation", "DirectionalShardedWriterStage"),
-    "LLMTranslationStage": ("nemo_curator.stages.audio.translation", "LLMTranslationStage"),
-    "TranslationExpanderStage": ("nemo_curator.stages.audio.translation", "TranslationExpanderStage"),
-    "TranslationManifestReader": ("nemo_curator.stages.audio.translation", "TranslationManifestReader"),
-    "TranslationManifestReaderStage": ("nemo_curator.stages.audio.translation", "TranslationManifestReaderStage"),
-    "all_shards_done": ("nemo_curator.stages.audio.translation", "all_shards_done"),
 }
 
 

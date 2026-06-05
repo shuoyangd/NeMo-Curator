@@ -82,7 +82,7 @@ from loguru import logger
 
 from nemo_curator.backends.xenna import XennaExecutor
 from nemo_curator.pipeline import Pipeline
-from nemo_curator.stages.audio import (
+from nemo_curator.stages.audio.translation import (
     DirectionalShardedWriterStage,
     LLMTranslationStage,
     TranslationExpanderStage,
