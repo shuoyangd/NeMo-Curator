@@ -149,7 +149,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--model_id",
         type=str,
-        default="Qwen/Qwen3.5-35B-A3B-FP8",
+        required=True,
         help="Translation LLM model ID.",
     )
 

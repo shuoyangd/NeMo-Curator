@@ -66,7 +66,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     """
 
     name: str = "LLMTranslation"
-    model_id: str = "Qwen/Qwen3.5-35B-A3B-FP8"
+    model_id: str | None = None
     translation_prompt: str | None = None
     translation_prompt_file: str | None = None
     system_prompt: str | None = None
@@ -103,6 +103,10 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     _n_inputs_logged: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if not self.model_id:
+            msg = "LLMTranslationStage: model_id is required"
+            raise ValueError(msg)
+
         if not self.tensor_parallel_size or self.tensor_parallel_size <= 0:
             from nemo_curator.utils.gpu_utils import get_gpu_count
             self.tensor_parallel_size = get_gpu_count()
