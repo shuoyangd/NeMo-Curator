@@ -87,6 +87,58 @@ def _resolve_input_paths(manifest_path: str | list[str]) -> list[str]:
     return resolved
 
 
+def _derive_input_root(manifest_path: str | list[str]) -> str | None:
+    """Infer a common input root directory from the ``--manifest`` argument.
+
+    Used to preserve the input subdirectory hierarchy in the output: each
+    shard's relative path is computed against this root. For each input we take
+    its directory (a directory as-is, a glob's non-wildcard prefix directory, or
+    a file's parent). Returns that single directory, the ``os.path.commonpath``
+    of several, or ``None`` when no directory can be determined. A single file
+    or a same-directory list therefore yields the file's own directory, so the
+    relative shard key collapses to the bare stem (flat output).
+    """
+    inputs = manifest_path if isinstance(manifest_path, list) else [manifest_path]
+    dirs: list[str] = []
+    for p in inputs:
+        if not p:
+            continue
+        if os.path.isdir(p):
+            dirs.append(os.path.abspath(p))
+        elif any(ch in p for ch in "*?["):
+            prefix = p
+            for ch in "*?[":
+                prefix = prefix.split(ch, 1)[0]
+            dirs.append(os.path.abspath(os.path.dirname(prefix)))
+        else:
+            dirs.append(os.path.abspath(os.path.dirname(p)))
+    if not dirs:
+        return None
+    if len(dirs) == 1:
+        return dirs[0]
+    try:
+        return os.path.commonpath(dirs)
+    except ValueError:
+        return None
+
+
+def _relative_shard_key(manifest_path: str, input_root: str | None) -> str:
+    """Return the shard key (relative path without extension) for a manifest.
+
+    When ``input_root`` is set and the manifest lives under it, the key is the
+    relative path with the ``.jsonl`` / ``.json`` extension stripped (preserving
+    subdirectories). Otherwise it falls back to the bare filename stem.
+    """
+    if input_root:
+        rel = os.path.relpath(os.path.abspath(manifest_path), os.path.abspath(input_root))
+        if not rel.startswith(".."):
+            for ext in (".jsonl", ".json"):
+                if rel.endswith(ext):
+                    return rel[: -len(ext)]
+            return rel
+    return Path(manifest_path).stem
+
+
 def all_shards_done(manifest_path: str | list[str], output_dir: str) -> bool:
     """Conservative pre-flight check used to skip ``pipeline.run()`` entirely.
 
@@ -163,6 +215,7 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     source_lang_key: str = "source_lang"
     source_lang_name_key: str = "source_lang_name"
     translate_to_key: str = "translate_to"
+    input_root: str | None = None
 
     _target_codes_norm: list[str] = field(default_factory=list, init=False, repr=False)
     _target_set: frozenset[str] = field(default_factory=frozenset, init=False, repr=False)
@@ -207,7 +260,7 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         results: list[AudioTask] = []
 
         for manifest in task.data:
-            shard_key = Path(manifest).stem
+            shard_key = _relative_shard_key(manifest, self.input_root)
             fs, resolved = url_to_fs(manifest)
 
             entries: list[dict[str, Any]] = []
@@ -370,6 +423,7 @@ class TranslationManifestReader(CompositeStage[_EmptyTask, AudioTask]):
                 source_lang_key=self.source_lang_key,
                 source_lang_name_key=self.source_lang_name_key,
                 translate_to_key=self.translate_to_key,
+                input_root=_derive_input_root(self.manifest_path),
             ),
         ]
 
