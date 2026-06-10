@@ -21,8 +21,10 @@ per-row language enrichment.
 
 Shard identity
 --------------
-``shard_key = Path(manifest_path).stem``.  The writer materialises one
-output file per ``(shard_key, direction)`` pair at
+``shard_key`` is the manifest path relative to the inferred input root with
+its extension stripped, so input subdirectories are preserved (e.g. ``en/m1``);
+it falls back to the bare filename stem for a single file / flat input.  The
+writer materialises one output file per ``(shard_key, direction)`` pair at
 ``{output_dir}/{shard_key}_{src}-{tgt}.jsonl[.done]``.
 
 Resume semantics
@@ -208,7 +210,9 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         direction rules (En -> X, X -> En only).
 
     Each emitted ``AudioTask`` carries:
-      * ``_metadata["_shard_key"]``       — ``Path(manifest).stem``.
+      * ``_metadata["_shard_key"]``       — manifest path relative to the input
+        root, extension stripped (subdirectories preserved); the bare stem when
+        input is flat.
       * ``_metadata["_shard_total"]``     — total non-empty lines.
       * ``_metadata["direction_counts"]`` — dict ``"{src}-{tgt}" -> int``
         the writer uses to know when each direction is complete.

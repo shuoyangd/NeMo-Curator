@@ -32,11 +32,13 @@ count, the bare ``.jsonl`` is renamed to ``.jsonl.done`` — and that file
 *is* the final per-(manifest, direction) output (no separate reconciliation
 step).
 
-Open-append-close per row
+Batched open-append-close
 -------------------------
-The writer does not hold persistent file handles.  Each ``process()`` call
-opens the per-direction file in ``"a"`` mode, writes one line, and closes
-it.  This keeps the actor's state minimal and survives mid-shard actor
+The writer does not hold persistent file handles.  Each ``process_batch()``
+call groups its rows by ``(shard_key, direction)`` handle and does a single
+open (``"a"`` mode) + append + close per group, instead of one per row, to
+lift the per-row fsync ceiling on networked/parallel filesystems (e.g.
+Lustre).  This keeps the actor's state minimal and survives mid-shard actor
 restarts cleanly when combined with the disk-based counter recovery in
 ``setup()``.
 

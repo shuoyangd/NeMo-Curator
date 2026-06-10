@@ -37,7 +37,7 @@ Architecture
         {text, source_lang, target_lang (ISO), translation}.
 
     DirectionalShardedWriterStage (CPU, AudioTask → AudioTask)
-        Open-append-close per row to
+        Appends batched rows (grouped per (shard_key, direction)) to
         {output_dir}/{shard_key}_{src}-{tgt}.jsonl; renames to .done
         inline once the per-direction counter equals direction_counts
         for that direction.  setup() recovers counters from disk so
@@ -45,8 +45,10 @@ Architecture
 
 Final outputs land directly at::
 
-    {output_dir}/{manifest_stem}_{src}-{tgt}.jsonl.done
+    {output_dir}/{shard_key}_{src}-{tgt}.jsonl.done
 
+where ``shard_key`` mirrors the input manifest path under the input root
+(subdirectories preserved), or is just the manifest stem for flat input —
 e.g. ``m1_en-de.jsonl.done``, ``m1_en-fr.jsonl.done``,
 ``m2_en-de.jsonl.done``, …
 
