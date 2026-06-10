@@ -359,6 +359,16 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # Processing
     # ------------------------------------------------------------------
 
+    def _emit_empty_translations(self, task: AudioTask, targets: list[str], reason: str) -> None:
+        # Do not run the LLM, but keep the row with one empty translation per
+        # target so the writer's per-direction counter still reaches .done.
+        # ``setdefault`` preserves any translations already produced for the row.
+        translations = task.data.get(self.translations_key) or {}
+        for target_lang in targets:
+            translations.setdefault(target_lang, "")
+        task.data[self.translations_key] = translations
+        set_note(task.data, self.name, reason, self.notes_key)
+
     def process(self, task: AudioTask) -> AudioTask:
         return self.process_batch([task])[0]
 
@@ -392,28 +402,16 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             if not targets:
                 continue
 
-            # Honor the _skipme flag (non-empty string or boolean True): do not
-            # run the LLM, but keep the row with one empty translation per target
-            # so the writer's per-direction counter still reaches .done.
+            # Honor the _skipme flag (non-empty string or boolean True): keep the
+            # row but emit empty translations instead of running the LLM.
             if data.get(self.skip_me_key, ""):
-                translations = task.data.get(self.translations_key) or {}
-                for target_lang in targets:
-                    translations.setdefault(target_lang, "")
-                task.data[self.translations_key] = translations
-                set_note(task.data, self.name, "skipped (flagged)", self.notes_key)
+                self._emit_empty_translations(task, targets, "skipped (flagged)")
                 continue
 
             text = data.get(self.text_key, "")
             if not text or not text.strip():
-                # Empty text: do not run the LLM, but still populate one empty
-                # translation per target so the writer's per-direction counter
-                # matches the reader's expectation.  Without this the shard's
-                # direction file would stay open and never be renamed to .done.
-                translations = task.data.get(self.translations_key) or {}
-                for target_lang in targets:
-                    translations.setdefault(target_lang, "")
-                task.data[self.translations_key] = translations
-                set_note(task.data, self.name, "skipped (empty text)", self.notes_key)
+                # Empty source text: nothing to translate, emit empty translations.
+                self._emit_empty_translations(task, targets, "skipped (empty text)")
                 continue
 
             for target_lang in targets:
