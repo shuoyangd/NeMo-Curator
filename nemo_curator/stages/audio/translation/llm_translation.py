@@ -143,15 +143,6 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             self.tensor_parallel_size = get_gpu_count()
         self.resources = Resources(gpus=float(self.tensor_parallel_size))
 
-    def num_workers(self) -> int | None:
-        return self.num_workers_override
-
-    def xenna_stage_spec(self) -> dict[str, Any]:
-        spec: dict[str, Any] = {}
-        if self.num_workers_override is not None:
-            spec["num_workers"] = self.num_workers_override
-        return spec
-
         self._translation_prompt = self._resolve_prompt(
             inline=self.translation_prompt,
             file_path=self.translation_prompt_file,
@@ -169,6 +160,15 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             for _, field_name, _, _ in string.Formatter().parse(self._translation_prompt)
             if field_name
         )
+
+    def num_workers(self) -> int | None:
+        return self.num_workers_override
+
+    def xenna_stage_spec(self) -> dict[str, Any]:
+        spec: dict[str, Any] = {}
+        if self.num_workers_override is not None:
+            spec["num_workers"] = self.num_workers_override
+        return spec
 
     # ------------------------------------------------------------------
     # Prompt resolution
