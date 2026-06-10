@@ -203,6 +203,17 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         # when Ray Data / Xenna tears down / respawns an actor mid-stream.
         enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0").lower() in ("1", "true", "yes")
 
+        # Optionally force-disable vLLM V1 async scheduling — the
+        # `step_with_batch_queue` path that deadlocks (SM-100%/mem-0% spin) after
+        # Ray Data / Xenna tears down/respawns an actor mid-stream. VLLM_ASYNC_SCHEDULING=0
+        # forces synchronous stepping; unset -> vLLM default (auto-on in V1).
+        _async = os.environ.get("VLLM_ASYNC_SCHEDULING", "").strip().lower()
+        async_kwargs: dict[str, Any] = {}
+        if _async in ("0", "false", "no"):
+            async_kwargs["async_scheduling"] = False
+        elif _async in ("1", "true", "yes"):
+            async_kwargs["async_scheduling"] = True
+
         logger.info(
             "LLMTranslation: loading {} (tp={}, max_model_len={}, "
             "max_num_batched_tokens={}, kv_cache_dtype={}, enforce_eager={})",
@@ -227,6 +238,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             kv_cache_dtype=self.kv_cache_dtype,
             enforce_eager=enforce_eager,
             seed=self.seed,
+            **async_kwargs,
         )
         self._tokenizer = self._llm.get_tokenizer()
         self._sampling_params = SamplingParams(
