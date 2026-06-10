@@ -137,29 +137,32 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
             return
 
         recovered = 0
-        for fname in os.listdir(self.output_dir):
-            if not fname.endswith(".jsonl"):
-                continue
-            full = os.path.join(self.output_dir, fname)
-            if os.path.exists(full + ".done"):
-                continue
-            base = fname[: -len(".jsonl")]
-            parts = base.rsplit("_", 1)
-            if len(parts) != 2 or "-" not in parts[1]:
-                # Not a "{shard_key}_{src}-{tgt}.jsonl" filename — ignore.
-                continue
-            handle_key = base
-            try:
-                with open(full, "rb") as f:
-                    self._seen_counts[handle_key] = sum(1 for _ in f)
-            except OSError as exc:
-                logger.warning(
-                    "DirectionalShardedWriter: failed to recover line count for {}: {}",
-                    full,
-                    exc,
-                )
-                continue
-            recovered += 1
+        for root, _dirs, files in os.walk(self.output_dir):
+            for fname in files:
+                if not fname.endswith(".jsonl"):
+                    continue
+                full = os.path.join(root, fname)
+                if os.path.exists(full + ".done"):
+                    continue
+                # handle_key is the path relative to output_dir (sans extension),
+                # so it carries any mirrored subdirectories from the input tree.
+                base = os.path.relpath(full, self.output_dir)[: -len(".jsonl")]
+                parts = base.rsplit("_", 1)
+                if len(parts) != 2 or "-" not in parts[1]:
+                    # Not a "{shard_key}_{src}-{tgt}.jsonl" filename — ignore.
+                    continue
+                handle_key = base
+                try:
+                    with open(full, "rb") as f:
+                        self._seen_counts[handle_key] = sum(1 for _ in f)
+                except OSError as exc:
+                    logger.warning(
+                        "DirectionalShardedWriter: failed to recover line count for {}: {}",
+                        full,
+                        exc,
+                    )
+                    continue
+                recovered += 1
 
         if recovered:
             logger.info(
@@ -219,7 +222,10 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
             return task
 
         # Open-append-close per row.  Cheap on local disk and keeps actor
-        # state minimal so restarts can be recovered from disk.
+        # state minimal so restarts can be recovered from disk.  The shard_key
+        # may carry subdirectories (mirrored from the input manifest tree), so
+        # make sure the parent directory exists before appending.
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(task.data, ensure_ascii=False) + "\n")
 
