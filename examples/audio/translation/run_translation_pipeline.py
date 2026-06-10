@@ -64,7 +64,7 @@ Example
 ::
 
     python run_translation_pipeline.py \\
-        --manifest m1.jsonl m2.jsonl \\
+        --manifest /data/manifests \\
         --output_dir /data/translations \\
         --target_langs de fr ru ja \\
         --model_id Qwen/Qwen3-8B
@@ -99,10 +99,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--manifest",
         type=str,
         required=True,
-        nargs="+",
         help=(
-            "Input JSONL manifest path(s). Accepts individual files, directories, "
-            "or glob patterns (FilePartitioningStage handles discovery). One file == one shard."
+            "Path to JSONL manifest(s). Accepts a single file, a directory (scanned "
+            "recursively for *.jsonl/*.json), or a glob pattern. FilePartitioningStage "
+            "handles discovery. One file == one shard."
         ),
     )
     ap.add_argument(
