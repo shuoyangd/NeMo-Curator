@@ -26,6 +26,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
+from nemo_curator.stages.audio.pipeline_utils import set_note
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
@@ -103,6 +104,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     target_lang_key: str = "translate_to"
     translations_key: str = "translations"
     skip_me_key: str = "_skipme"
+    notes_key: str = "additional_notes"
     tensor_parallel_size: int | None = None
     max_output_tokens: int = 1024
     max_model_len: int = 4096
@@ -395,6 +397,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 for target_lang in targets:
                     translations.setdefault(target_lang, "")
                 task.data[self.translations_key] = translations
+                set_note(task.data, self.name, "skipped (flagged)", self.notes_key)
                 continue
 
             text = data.get(self.text_key, "")
@@ -407,6 +410,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 for target_lang in targets:
                     translations.setdefault(target_lang, "")
                 task.data[self.translations_key] = translations
+                set_note(task.data, self.name, "skipped (empty text)", self.notes_key)
                 continue
 
             for target_lang in targets:
@@ -425,11 +429,17 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 use_tqdm=False,
             )
 
+            # Track per-task direction tallies so we can record one summary note.
+            per_task_total: dict[int, int] = {}
+            per_task_empty: dict[int, int] = {}
+
             for seq_idx, (task_idx, target_lang) in enumerate(prompt_owners):
                 task = tasks[task_idx]
                 translation = outputs[seq_idx].outputs[0].text.strip()
 
+                per_task_total[task_idx] = per_task_total.get(task_idx, 0) + 1
                 if not translation:
+                    per_task_empty[task_idx] = per_task_empty.get(task_idx, 0) + 1
                     logger.warning(
                         "LLMTranslation: empty translation for target={}", target_lang,
                     )
@@ -438,6 +448,13 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 translations[target_lang] = translation
                 task.data[self.translations_key] = translations
                 self._n_processed += 1
+
+            for task_idx, total in per_task_total.items():
+                empty = per_task_empty.get(task_idx, 0)
+                note = f"translated ({total - empty}/{total})"
+                if empty:
+                    note = f"{note}, {empty} empty"
+                set_note(tasks[task_idx].data, self.name, note, self.notes_key)
 
         logger.debug("LLMTranslation: batch of {} tasks ({} translations)", len(tasks), len(prompts))
         return tasks
