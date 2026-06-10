@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 import string
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,32 @@ except ImportError:
 
 _DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "translation_prompt.md"
 _DEFAULT_SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "system_prompt.md"
+
+
+def _isolate_compile_caches() -> None:
+    """Give this actor process its own torch.compile / inductor / triton caches.
+
+    Multiple vLLM engines co-located on one node otherwise race on the *shared*
+    default cache dirs (``~/.cache``, ``/tmp/torchinductor_<user>``,
+    ``/tmp/triton``). That race corrupts the inductor cache pickle
+    ("pickle data was truncated" / "CompiledFxGraph has no compiled_fn_runner"),
+    kills the EngineCore, and its restart then hangs at CUDA-graph capture —
+    wedging the whole pipeline (idle GPUs -> killed by the cluster idle reaper).
+    Keying every cache dir by PID isolates each engine. Each Ray actor runs one
+    engine in its own process, and vLLM's spawned EngineCore subprocess inherits
+    these env vars, so all of an actor's (re)starts share one private cache while
+    different actors never collide. Must run before the ``LLM(...)`` constructor.
+    """
+    root = os.environ.get("COMPILE_CACHE_ROOT", os.environ.get("TMPDIR", "/tmp"))
+    base = os.path.join(root, f"compile_cache_{os.getpid()}")
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(base, "inductor")
+    os.environ["TRITON_CACHE_DIR"] = os.path.join(base, "triton")
+    os.environ["VLLM_CACHE_ROOT"] = os.path.join(base, "vllm")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError as exc:  # non-fatal — torch/triton/vllm create them lazily too
+        logger.warning("_isolate_compile_caches: could not pre-create {}: {}", base, exc)
+    logger.info("Per-process compile caches under {} (pid={})", base, os.getpid())
 
 
 @dataclass
@@ -163,6 +190,10 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     def _init_model(self) -> None:
         if not VLLM_AVAILABLE:
             raise ImportError("vLLM is required for LLMTranslationStage. pip install vllm")
+
+        # Isolate this process's compile caches BEFORE building the engine, so
+        # co-located engines don't race on the shared inductor/triton cache.
+        _isolate_compile_caches()
 
         max_num_batched_tokens = self.max_num_batched_tokens or max(self.max_model_len, 8192)
 
