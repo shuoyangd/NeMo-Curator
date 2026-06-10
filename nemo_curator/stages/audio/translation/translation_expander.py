@@ -34,7 +34,11 @@ from dataclasses import dataclass, field
 from loguru import logger
 
 from nemo_curator.stages.audio.translation.language_map import name_to_code
-from nemo_curator.stages.audio.translation.translation_utils import SOURCE_LANG_NAME_KEY, TRANSLATE_TO_KEY
+from nemo_curator.stages.audio.translation.translation_utils import (
+    SOURCE_LANG_NAME_KEY,
+    TRANSLATE_TO_KEY,
+    TRANSLATIONS_KEY,
+)
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask
 
@@ -62,7 +66,7 @@ class TranslationExpanderStage(ProcessingStage[AudioTask, AudioTask]):
 
     name: str = "TranslationExpander"
     source_lang_key: str = "source_lang"
-    translations_key: str = "translations"
+    translations_key: str = TRANSLATIONS_KEY
     target_lang_key: str = "target_lang"
     translation_key: str = "translation"
 

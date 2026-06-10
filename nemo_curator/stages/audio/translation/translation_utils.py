@@ -42,6 +42,9 @@ DONE_EXT = ".jsonl.done"
 # Internal scratch keys (never appear in the output manifest).
 SOURCE_LANG_NAME_KEY = "source_lang_name"
 TRANSLATE_TO_KEY = "translate_to"
+# Internal handoff: LLMTranslationStage writes this dict, TranslationExpander
+# reads it and strips it before output, so it never reaches the final manifest.
+TRANSLATIONS_KEY = "translations"
 
 
 def direction_key(src_code: str, tgt_code: str) -> str:

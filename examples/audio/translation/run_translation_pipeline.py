@@ -152,12 +152,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     ap.add_argument("--text_key", type=str, default="pnc_text", help="Manifest key for source text.")
     ap.add_argument(
-        "--translations_key",
-        type=str,
-        default="translations",
-        help="Intermediate key for the {lang_name: text} dict produced by LLMTranslationStage.",
-    )
-    ap.add_argument(
         "--skip_me_key",
         type=str,
         default="_skipme",
@@ -217,7 +211,6 @@ def main() -> None:
             system_prompt=args.system_prompt,
             system_prompt_file=args.system_prompt_file,
             text_key=args.text_key,
-            translations_key=args.translations_key,
             skip_me_key=args.skip_me_key,
             tensor_parallel_size=args.tensor_parallel_size,
             num_workers_override=args.num_workers,
@@ -238,7 +231,6 @@ def main() -> None:
         ),
         TranslationExpanderStage(
             source_lang_key=args.source_lang_code_key,
-            translations_key=args.translations_key,
         ),
         DirectionalShardedWriterStage(
             output_dir=args.output_dir,
