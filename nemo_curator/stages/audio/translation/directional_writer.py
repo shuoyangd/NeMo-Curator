@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -95,6 +96,10 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
     name: str = "DirectionalShardedWriter"
     source_lang_key: str = "source_lang"
     target_lang_key: str = "target_lang"
+    # Group rows per (shard, direction) handle and do one open+append+close per
+    # group instead of one per row, lifting the per-row fsync ceiling on
+    # networked/parallel filesystems (e.g. Lustre).
+    batch_size: int = 256
 
     # Rows written per "{shard_key}_{src}-{tgt}" handle key.
     _seen_counts: dict[str, int] = field(default_factory=dict, init=False, repr=False)
@@ -194,60 +199,60 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
     # ------------------------------------------------------------------
 
     def process(self, task: AudioTask) -> AudioTask:
-        shard_key: str = task._metadata.get("_shard_key", "unknown_shard")
-        direction_counts: dict[str, int] = task._metadata.get("direction_counts", {})
+        return self.process_batch([task])[0]
 
-        src_raw = task.data.get(self.source_lang_key, "")
-        tgt_raw = task.data.get(self.target_lang_key, "")
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+        # Ray Data may pass tasks as an ndarray, so use len() not `if not tasks`.
+        if len(tasks) == 0:
+            return []
 
-        if not src_raw or not tgt_raw:
-            logger.warning(
-                "DirectionalShardedWriter: task {} missing source/target lang keys; skipping write",
-                task.task_id,
-            )
-            return task
+        # Group rows by "{shard_key}_{src}-{tgt}" so each handle is opened once.
+        by_handle: dict[str, list[AudioTask]] = defaultdict(list)
+        for task in tasks:
+            src_raw = task.data.get(self.source_lang_key, "")
+            tgt_raw = task.data.get(self.target_lang_key, "")
+            if not src_raw or not tgt_raw:
+                logger.warning(
+                    "DirectionalShardedWriter: task {} missing source/target lang keys; skipping write",
+                    task.task_id,
+                )
+                continue
+            shard_key: str = task._metadata.get("_shard_key", "unknown_shard")
+            # Normalise so handle_key matches the keys the reader put in direction_counts.
+            direction = f"{_normalize_code(src_raw)}-{_normalize_code(tgt_raw)}"
+            by_handle[f"{shard_key}_{direction}"].append(task)
 
-        # Normalise so handle_key matches the keys the reader put in direction_counts.
-        src = _normalize_code(src_raw)
-        tgt = _normalize_code(tgt_raw)
-        direction = f"{src}-{tgt}"
-        handle_key = f"{shard_key}_{direction}"
+        for handle_key, group in by_handle.items():
+            out_path = os.path.join(self.output_dir, f"{handle_key}.jsonl")
+            done_path = out_path + ".done"
 
-        out_path = os.path.join(self.output_dir, f"{handle_key}.jsonl")
-        done_path = out_path + ".done"
+            # If this direction is already final, leave it alone.
+            if os.path.exists(done_path):
+                self._n_skipped_done += len(group)
+                continue
 
-        # If this direction is already final, leave it alone.
-        if os.path.exists(done_path):
-            self._n_skipped_done += 1
-            return task
+            # One open+append+close per (batch, handle).  The shard_key may carry
+            # subdirectories (mirrored from the input manifest tree), so make sure
+            # the parent directory exists before appending.
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "a", encoding="utf-8") as fh:
+                for task in group:
+                    fh.write(json.dumps(task.data, ensure_ascii=False) + "\n")
 
-        # Open-append-close per row.  Cheap on local disk and keeps actor
-        # state minimal so restarts can be recovered from disk.  The shard_key
-        # may carry subdirectories (mirrored from the input manifest tree), so
-        # make sure the parent directory exists before appending.
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(task.data, ensure_ascii=False) + "\n")
+            self._n_written += len(group)
+            self._seen_counts[handle_key] = self._seen_counts.get(handle_key, 0) + len(group)
 
-        self._n_written += 1
-        self._seen_counts[handle_key] = self._seen_counts.get(handle_key, 0) + 1
+            direction = handle_key.rsplit("_", 1)[1]
+            expected = group[0]._metadata.get("direction_counts", {}).get(direction, -1)
+            if expected > 0 and self._seen_counts[handle_key] >= expected:
+                os.rename(out_path, done_path)
+                self._n_directions_completed += 1
+                logger.info(
+                    "DirectionalShardedWriter: direction complete -> {}",
+                    done_path,
+                )
 
-        expected = direction_counts.get(direction, -1)
-        if expected > 0 and self._seen_counts[handle_key] >= expected:
-            os.rename(out_path, done_path)
-            self._n_directions_completed += 1
-            logger.info(
-                "DirectionalShardedWriter: direction complete -> {}",
-                done_path,
-            )
-
-        return AudioTask(
-            task_id=task.task_id,
-            dataset_name=task.dataset_name,
-            data=task.data,
-            _metadata=dict(task._metadata),
-            _stage_perf=list(task._stage_perf),
-        )
+        return tasks
 
     # ------------------------------------------------------------------
     # Executor hints
