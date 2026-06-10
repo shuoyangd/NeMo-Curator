@@ -90,28 +90,11 @@ class TranslationExpanderStage(ProcessingStage[AudioTask, AudioTask]):
 
         results: list[AudioTask] = []
         for display_name, translated_text in translations.items():
-            try:
-                tgt_code = name_to_code(display_name)
-            except KeyError:
-                logger.warning(
-                    "TranslationExpander: unknown display name '{}' for task {}; skipping",
-                    display_name,
-                    task.task_id,
-                )
-                continue
-
-            if not translated_text or not translated_text.strip():
-                logger.warning(
-                    "TranslationExpander: empty translation for target '{}' in task {}; "
-                    "emitting row with empty translation to preserve row counts",
-                    display_name,
-                    task.task_id,
-                )
-                translated_text = ""
+            tgt_code = name_to_code(display_name)
 
             output_data = dict(source_data)
             output_data[self.target_lang_key] = tgt_code
-            output_data[self.translation_key] = translated_text
+            output_data[self.translation_key] = (translated_text or "").strip()
 
             results.append(
                 AudioTask(
