@@ -118,6 +118,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     repetition_penalty: float = 1.0
     seed: int = 1234
     log_inputs: int = 5
+    num_workers_override: int | None = None
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
     batch_size: int = 64
 
@@ -139,6 +140,15 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             from nemo_curator.utils.gpu_utils import get_gpu_count
             self.tensor_parallel_size = get_gpu_count()
         self.resources = Resources(gpus=float(self.tensor_parallel_size))
+
+    def num_workers(self) -> int | None:
+        return self.num_workers_override
+
+    def xenna_stage_spec(self) -> dict[str, Any]:
+        spec: dict[str, Any] = {}
+        if self.num_workers_override is not None:
+            spec["num_workers"] = self.num_workers_override
+        return spec
 
         self._translation_prompt = self._resolve_prompt(
             inline=self.translation_prompt,

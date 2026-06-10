@@ -181,6 +181,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     # vLLM params
     ap.add_argument("--tensor_parallel_size", type=int, default=None)
+    ap.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Explicit number of GPU worker replicas for the translation stage under Xenna.",
+    )
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--max_output_tokens", type=int, default=1024)
     ap.add_argument("--max_model_len", type=int, default=4096)
@@ -230,6 +236,7 @@ def main() -> None:
             translations_key=args.translations_key,
             skip_me_key=args.skip_me_key,
             tensor_parallel_size=args.tensor_parallel_size,
+            num_workers_override=args.num_workers,
             max_output_tokens=args.max_output_tokens,
             max_model_len=args.max_model_len,
             max_num_seqs=args.max_num_seqs,
