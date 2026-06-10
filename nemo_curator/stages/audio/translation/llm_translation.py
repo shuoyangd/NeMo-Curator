@@ -266,7 +266,10 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         _node_info: NodeInfo | None = None,
         _worker_metadata: WorkerMetadata | None = None,
     ) -> None:
-        self._init_model()
+        # No-op: the vLLM engine is a per-worker GPU resource, so it must be
+        # built lazily in setup() (once per actor), not at node-level setup.
+        # Loading here would build the engine twice (node + worker).
+        pass
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         if self._llm is None:
