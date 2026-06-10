@@ -279,19 +279,40 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 logger.warning("TranslationManifestReader: empty manifest {}, skipping", manifest)
                 continue
 
-            # Per-row enrichment + direction_counts in a single pass.
+            # Per-row enrichment + direction_counts in a single pass. Rows whose
+            # source language yields no valid translation direction (neither
+            # English nor a configured target) are dropped here: emitting them
+            # would push a target-less row through LLMTranslation, which skips it
+            # without writing a ``translations`` key and then fails
+            # TranslationExpander's input validation.
             direction_counts: dict[str, int] = {}
+            kept_entries: list[dict[str, Any]] = []
             for row in entries:
                 src_raw = row.get(self.source_lang_key, "")
                 src_norm = _normalize_code(src_raw) if src_raw else ""
 
+                target_names = self._row_target_names(src_norm)
+                if not target_names:
+                    continue
+
                 if src_raw:
                     row[self.source_lang_name_key] = lang_code_to_name(src_raw)
-                row[self.translate_to_key] = self._row_target_names(src_norm)
+                row[self.translate_to_key] = target_names
 
                 for tgt_norm in self._row_targets(src_norm):
                     key = f"{src_norm}-{tgt_norm}"
                     direction_counts[key] = direction_counts.get(key, 0) + 1
+
+                kept_entries.append(row)
+
+            if not kept_entries:
+                logger.info(
+                    "TranslationManifestReader: no translatable rows in {} "
+                    "(shard_key={}), skipping",
+                    manifest,
+                    shard_key,
+                )
+                continue
 
             # Resume: skip whole shard if every expected direction is .done.
             # Otherwise delete any partial .jsonl (no .done sibling) so the
@@ -328,7 +349,7 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                                 exc,
                             )
 
-            shard_total = len(entries)
+            shard_total = len(kept_entries)
             metadata_template: dict[str, Any] = {
                 **task._metadata,
                 "_shard_key": shard_key,
@@ -336,7 +357,7 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 "direction_counts": dict(direction_counts),
             }
 
-            for entry in entries:
+            for entry in kept_entries:
                 results.append(
                     AudioTask(
                         data=entry,
