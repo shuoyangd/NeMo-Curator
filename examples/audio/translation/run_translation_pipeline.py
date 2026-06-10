@@ -169,11 +169,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Explicit number of GPU worker replicas for the translation stage under Xenna.",
     )
-    ap.add_argument("--batch_size", type=int, default=256)
+    ap.add_argument("--batch_size", type=int, default=512)
     ap.add_argument("--max_output_tokens", type=int, default=256)
     ap.add_argument("--max_model_len", type=int, default=1024)
-    ap.add_argument("--max_num_seqs", type=int, default=128)
-    ap.add_argument("--max_num_batched_tokens", type=int, default=None)
+    ap.add_argument("--max_num_seqs", type=int, default=512)
+    ap.add_argument("--max_num_batched_tokens", type=int, default=16384)
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.90)
     ap.add_argument("--kv_cache_dtype", type=str, default="fp8")
     ap.add_argument("--temperature", type=float, default=0.7)
