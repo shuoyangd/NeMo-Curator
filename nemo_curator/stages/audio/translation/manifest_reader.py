@@ -144,9 +144,12 @@ def all_shards_done(manifest_path: str | list[str], output_dir: str) -> bool:
 
     Returns True when:
       * ``output_dir`` exists,
-      * every input file's stem has at least one ``{stem}_*-*.jsonl.done``
-        file in ``output_dir``, and
-      * no orphan ``{stem}_*-*.jsonl`` (partial) files remain.
+      * every input file's shard key has at least one
+        ``{shard_key}_*-*.jsonl.done`` file under ``output_dir``, and
+      * no orphan ``{shard_key}_*-*.jsonl`` (partial) files remain.
+
+    Shard keys are relative paths (e.g. ``en/m1``) so the comparison mirrors
+    the input subdirectory hierarchy.
 
     Returns False when the check cannot be made confidently — that just
     means ``pipeline.run()`` will execute, and the reader will still skip
@@ -159,26 +162,28 @@ def all_shards_done(manifest_path: str | list[str], output_dir: str) -> bool:
     paths = _resolve_input_paths(manifest_path)
     if not paths:
         return False
-    input_stems = {Path(p).stem for p in paths}
+    input_root = _derive_input_root(manifest_path)
+    input_keys = {_relative_shard_key(p, input_root) for p in paths}
 
-    done_stems: set[str] = set()
-    partial_stems: set[str] = set()
-    for fname in os.listdir(output_dir):
-        full = os.path.join(output_dir, fname)
-        if not os.path.isfile(full):
-            continue
-        if fname.endswith(".jsonl.done"):
-            base = fname[: -len(".jsonl.done")]
-            parts = base.rsplit("_", 1)
-            if len(parts) == 2 and "-" in parts[1]:
-                done_stems.add(parts[0])
-        elif fname.endswith(".jsonl"):
-            base = fname[: -len(".jsonl")]
-            parts = base.rsplit("_", 1)
-            if len(parts) == 2 and "-" in parts[1]:
-                partial_stems.add(parts[0])
+    done_keys: set[str] = set()
+    partial_keys: set[str] = set()
+    for root, _dirs, files in os.walk(output_dir):
+        for fname in files:
+            full = os.path.join(root, fname)
+            if not os.path.isfile(full):
+                continue
+            if fname.endswith(".jsonl.done"):
+                base = os.path.relpath(full, output_dir)[: -len(".jsonl.done")]
+                parts = base.rsplit("_", 1)
+                if len(parts) == 2 and "-" in parts[1]:
+                    done_keys.add(parts[0])
+            elif fname.endswith(".jsonl"):
+                base = os.path.relpath(full, output_dir)[: -len(".jsonl")]
+                parts = base.rsplit("_", 1)
+                if len(parts) == 2 and "-" in parts[1]:
+                    partial_keys.add(parts[0])
 
-    return input_stems.issubset(done_stems) and not partial_stems
+    return input_keys.issubset(done_keys) and not partial_keys
 
 
 # ----------------------------------------------------------------------------
