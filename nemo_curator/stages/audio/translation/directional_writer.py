@@ -66,7 +66,12 @@ from loguru import logger
 
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.backends.utils import RayStageSpecKeys
-from nemo_curator.stages.audio.translation.shard_paths import direction_key, handle_key, output_paths, parse_handle_key
+from nemo_curator.stages.audio.translation.translation_utils import (
+    direction_key,
+    handle_key,
+    output_paths,
+    parse_handle_key,
+)
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask
 

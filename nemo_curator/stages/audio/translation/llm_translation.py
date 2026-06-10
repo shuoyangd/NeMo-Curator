@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
 from nemo_curator.stages.audio.pipeline_utils import set_note
+from nemo_curator.stages.audio.translation.translation_utils import SOURCE_LANG_NAME_KEY, TRANSLATE_TO_KEY
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
@@ -100,8 +101,8 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     system_prompt: str | None = None
     system_prompt_file: str | None = None
     text_key: str = "pnc_text"
-    source_lang_key: str = "source_lang_name"
-    target_lang_key: str = "translate_to"
+    source_lang_key: str = SOURCE_LANG_NAME_KEY
+    target_lang_key: str = TRANSLATE_TO_KEY
     translations_key: str = "translations"
     skip_me_key: str = "_skipme"
     notes_key: str = "additional_notes"

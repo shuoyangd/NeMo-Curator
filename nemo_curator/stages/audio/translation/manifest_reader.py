@@ -52,7 +52,12 @@ from loguru import logger
 
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.audio.translation.language_map import LANGUAGE_MAP, _normalize_code, lang_code_to_name
-from nemo_curator.stages.audio.translation.shard_paths import output_paths, parse_handle_key
+from nemo_curator.stages.audio.translation.translation_utils import (
+    SOURCE_LANG_NAME_KEY,
+    TRANSLATE_TO_KEY,
+    output_paths,
+    parse_handle_key,
+)
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
 from nemo_curator.tasks import AudioTask, FileGroupTask, _EmptyTask
@@ -219,8 +224,8 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     output_dir: str = ""
     target_lang_codes: list[str] = field(default_factory=list)
     source_lang_key: str = "source_lang"
-    source_lang_name_key: str = "source_lang_name"
-    translate_to_key: str = "translate_to"
+    source_lang_name_key: str = SOURCE_LANG_NAME_KEY
+    translate_to_key: str = TRANSLATE_TO_KEY
     input_root: str | None = None
 
     _target_codes_norm: list[str] = field(default_factory=list, init=False, repr=False)
@@ -416,8 +421,8 @@ class TranslationManifestReader(CompositeStage[_EmptyTask, AudioTask]):
     output_dir: str = ""
     target_lang_codes: list[str] = field(default_factory=list)
     source_lang_key: str = "source_lang"
-    source_lang_name_key: str = "source_lang_name"
-    translate_to_key: str = "translate_to"
+    source_lang_name_key: str = SOURCE_LANG_NAME_KEY
+    translate_to_key: str = TRANSLATE_TO_KEY
     files_per_partition: int | None = 1
     file_extensions: list[str] | None = None
     storage_options: dict[str, Any] | None = None

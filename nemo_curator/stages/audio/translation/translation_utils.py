@@ -12,16 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Single source of truth for the per-direction shard file contract.
+"""Shared contract helpers for the translation pipeline.
 
-Every translation output file is named::
+Two things live here so the stages cannot drift apart:
+
+1. The per-direction shard file contract. Every output file is named::
 
     {output_dir}/{shard_key}_{src}-{tgt}.jsonl[.done]
 
-where ``shard_key`` may itself contain subdirectories mirrored from the input
-manifest tree (e.g. ``en/m1``). The reader (resume + pre-flight) and the writer
-(recovery + completion) all build and parse this contract; keeping the format in
-one place stops those sites from drifting apart.
+   where ``shard_key`` may itself contain subdirectories mirrored from the input
+   manifest tree (e.g. ``en/m1``). The reader (resume + pre-flight) and the writer
+   (recovery + completion) all build and parse this contract.
+
+2. The internal scratch row keys. The reader writes them, the LLM stage consumes
+   and pops them, and the expander strips them before output, so they never reach
+   the final manifest. They are a fixed internal contract, intentionally not
+   user-configurable.
 """
 
 from __future__ import annotations
@@ -32,6 +38,10 @@ from nemo_curator.stages.audio.translation.language_map import _normalize_code
 
 JSONL_EXT = ".jsonl"
 DONE_EXT = ".jsonl.done"
+
+# Internal scratch keys (never appear in the output manifest).
+SOURCE_LANG_NAME_KEY = "source_lang_name"
+TRANSLATE_TO_KEY = "translate_to"
 
 
 def direction_key(src_code: str, tgt_code: str) -> str:

@@ -34,12 +34,14 @@ from dataclasses import dataclass, field
 from loguru import logger
 
 from nemo_curator.stages.audio.translation.language_map import name_to_code
+from nemo_curator.stages.audio.translation.translation_utils import SOURCE_LANG_NAME_KEY, TRANSLATE_TO_KEY
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask
 
 # Scratch keys written onto each row by ``TranslationManifestReaderStage``
-# that must not appear in the per-direction output rows.
-_RESOLVER_SCRATCH_KEYS = ("source_lang_name", "translate_to")
+# that must not appear in the per-direction output rows. Fixed internal contract
+# (see translation_utils) — kept in sync with the reader/LLM stage.
+_RESOLVER_SCRATCH_KEYS = (SOURCE_LANG_NAME_KEY, TRANSLATE_TO_KEY)
 
 
 @dataclass

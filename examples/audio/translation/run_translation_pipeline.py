@@ -132,18 +132,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="source_lang",
         help="Input manifest key holding the source language ISO code.",
     )
-    ap.add_argument(
-        "--source_lang_name_key",
-        type=str,
-        default="source_lang_name",
-        help="Intermediate key for resolved source language display name (written by the reader).",
-    )
-    ap.add_argument(
-        "--target_lang_key",
-        type=str,
-        default="translate_to",
-        help="Intermediate key for per-row list of target language display names (written by the reader).",
-    )
 
     # ------------------------------------------------------------------ Model
     ap.add_argument(
@@ -221,8 +209,6 @@ def main() -> None:
             output_dir=args.output_dir,
             target_lang_codes=args.target_langs,
             source_lang_key=args.source_lang_code_key,
-            source_lang_name_key=args.source_lang_name_key,
-            translate_to_key=args.target_lang_key,
         ),
         LLMTranslationStage(
             model_id=args.model_id,
@@ -231,8 +217,6 @@ def main() -> None:
             system_prompt=args.system_prompt,
             system_prompt_file=args.system_prompt_file,
             text_key=args.text_key,
-            source_lang_key=args.source_lang_name_key,
-            target_lang_key=args.target_lang_key,
             translations_key=args.translations_key,
             skip_me_key=args.skip_me_key,
             tensor_parallel_size=args.tensor_parallel_size,
