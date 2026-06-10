@@ -162,7 +162,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     spg.add_argument("--system_prompt", type=str, default=None)
     spg.add_argument("--system_prompt_file", type=str, default=None)
 
-    ap.add_argument("--text_key", type=str, default="text", help="Manifest key for source text.")
+    ap.add_argument("--text_key", type=str, default="pnc_text", help="Manifest key for source text.")
     ap.add_argument(
         "--translations_key",
         type=str,

@@ -99,7 +99,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     translation_prompt_file: str | None = None
     system_prompt: str | None = None
     system_prompt_file: str | None = None
-    text_key: str = "text"
+    text_key: str = "pnc_text"
     source_lang_key: str = "source_lang_name"
     target_lang_key: str = "translate_to"
     translations_key: str = "translations"
@@ -317,6 +317,9 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         semantic: dict[str, str] = {
             "target_lang": target_lang,
             "source_lang": source_lang,
+            # The {text} placeholder always resolves to the configured text_key
+            # (e.g. pnc_text), keeping it in sync with the empty-skip check.
+            "text": data.get(self.text_key, ""),
         }
 
         values: dict[str, str] = {}
