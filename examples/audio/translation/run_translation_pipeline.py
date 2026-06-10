@@ -169,6 +169,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="translations",
         help="Intermediate key for the {lang_name: text} dict produced by LLMTranslationStage.",
     )
+    ap.add_argument(
+        "--skip_me_key",
+        type=str,
+        default="_skipme",
+        help=(
+            "Manifest key flagging rows to skip. When truthy (non-empty string or boolean True), "
+            "the row is kept but receives an empty translation instead of being sent to the LLM."
+        ),
+    )
 
     # vLLM params
     ap.add_argument("--tensor_parallel_size", type=int, default=None)
@@ -219,6 +228,7 @@ def main() -> None:
             source_lang_key=args.source_lang_name_key,
             target_lang_key=args.target_lang_key,
             translations_key=args.translations_key,
+            skip_me_key=args.skip_me_key,
             tensor_parallel_size=args.tensor_parallel_size,
             max_output_tokens=args.max_output_tokens,
             max_model_len=args.max_model_len,

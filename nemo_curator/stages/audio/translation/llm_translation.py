@@ -75,6 +75,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     source_lang_key: str = "source_lang_name"
     target_lang_key: str = "translate_to"
     translations_key: str = "translations"
+    skip_me_key: str = "_skipme"
     tensor_parallel_size: int | None = None
     max_output_tokens: int = 1024
     max_model_len: int = 4096
@@ -235,7 +236,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # ------------------------------------------------------------------
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.text_key, self.target_lang_key, self.source_lang_key]
+        return [], [self.text_key, self.target_lang_key, self.source_lang_key, self.skip_me_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.translations_key]
@@ -321,6 +322,16 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             # Skip tasks with no targets (these rows are not counted by the
             # reader either, so downstream row-count expectations stay matched).
             if not targets:
+                continue
+
+            # Honor the _skipme flag (non-empty string or boolean True): do not
+            # run the LLM, but keep the row with one empty translation per target
+            # so the writer's per-direction counter still reaches .done.
+            if data.get(self.skip_me_key, ""):
+                translations = task.data.get(self.translations_key) or {}
+                for target_lang in targets:
+                    translations.setdefault(target_lang, "")
+                task.data[self.translations_key] = translations
                 continue
 
             text = data.get(self.text_key, "")
