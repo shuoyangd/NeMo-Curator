@@ -52,6 +52,7 @@ from loguru import logger
 
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.audio.translation.language_map import LANGUAGE_MAP, _normalize_code, lang_code_to_name
+from nemo_curator.stages.audio.translation.shard_paths import output_paths, parse_handle_key
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
 from nemo_curator.tasks import AudioTask, FileGroupTask, _EmptyTask
@@ -174,14 +175,14 @@ def all_shards_done(manifest_path: str | list[str], output_dir: str) -> bool:
                 continue
             if fname.endswith(".jsonl.done"):
                 base = os.path.relpath(full, output_dir)[: -len(".jsonl.done")]
-                parts = base.rsplit("_", 1)
-                if len(parts) == 2 and "-" in parts[1]:
-                    done_keys.add(parts[0])
+                parsed = parse_handle_key(base)
+                if parsed is not None:
+                    done_keys.add(parsed[0])
             elif fname.endswith(".jsonl"):
                 base = os.path.relpath(full, output_dir)[: -len(".jsonl")]
-                parts = base.rsplit("_", 1)
-                if len(parts) == 2 and "-" in parts[1]:
-                    partial_keys.add(parts[0])
+                parsed = parse_handle_key(base)
+                if parsed is not None:
+                    partial_keys.add(parsed[0])
 
     return input_keys.issubset(done_keys) and not partial_keys
 
@@ -318,23 +319,21 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             # Otherwise delete any partial .jsonl (no .done sibling) so the
             # writer's append mode starts from a clean slate.
             if self.output_dir and direction_counts:
-                done_paths = {
-                    d: os.path.join(self.output_dir, f"{shard_key}_{d}.jsonl.done")
-                    for d in direction_counts
+                direction_files = {
+                    d: output_paths(self.output_dir, shard_key, d) for d in direction_counts
                 }
-                if all(os.path.exists(p) for p in done_paths.values()):
+                if all(os.path.exists(done) for _, done in direction_files.values()):
                     logger.info(
                         "TranslationManifestReader: skipping completed shard {} "
                         "({} direction(s) all .done)",
                         shard_key,
-                        len(done_paths),
+                        len(direction_files),
                     )
                     continue
 
-                for direction, done_path in done_paths.items():
+                for partial, done_path in direction_files.values():
                     if os.path.exists(done_path):
                         continue
-                    partial = os.path.join(self.output_dir, f"{shard_key}_{direction}.jsonl")
                     if os.path.exists(partial):
                         try:
                             os.remove(partial)

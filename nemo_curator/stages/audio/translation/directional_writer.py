@@ -66,7 +66,7 @@ from loguru import logger
 
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.backends.utils import RayStageSpecKeys
-from nemo_curator.stages.audio.translation.language_map import _normalize_code
+from nemo_curator.stages.audio.translation.shard_paths import direction_key, handle_key, output_paths, parse_handle_key
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask
 
@@ -152,14 +152,13 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
                 # handle_key is the path relative to output_dir (sans extension),
                 # so it carries any mirrored subdirectories from the input tree.
                 base = os.path.relpath(full, self.output_dir)[: -len(".jsonl")]
-                parts = base.rsplit("_", 1)
-                if len(parts) != 2 or "-" not in parts[1]:
+                if parse_handle_key(base) is None:
                     # Not a "{shard_key}_{src}-{tgt}.jsonl" filename — ignore.
                     continue
-                handle_key = base
+                recovered_key = base
                 try:
                     with open(full, "rb") as f:
-                        self._seen_counts[handle_key] = sum(1 for _ in f)
+                        self._seen_counts[recovered_key] = sum(1 for _ in f)
                 except OSError as exc:
                     logger.warning(
                         "DirectionalShardedWriter: failed to recover line count for {}: {}",
@@ -218,13 +217,13 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
                 )
                 continue
             shard_key: str = task._metadata.get("_shard_key", "unknown_shard")
-            # Normalise so handle_key matches the keys the reader put in direction_counts.
-            direction = f"{_normalize_code(src_raw)}-{_normalize_code(tgt_raw)}"
-            by_handle[f"{shard_key}_{direction}"].append(task)
+            # Normalise so the handle key matches the keys the reader put in direction_counts.
+            direction = direction_key(src_raw, tgt_raw)
+            by_handle[handle_key(shard_key, direction)].append(task)
 
-        for handle_key, group in by_handle.items():
-            out_path = os.path.join(self.output_dir, f"{handle_key}.jsonl")
-            done_path = out_path + ".done"
+        for hkey, group in by_handle.items():
+            shard_key, direction = parse_handle_key(hkey)
+            out_path, done_path = output_paths(self.output_dir, shard_key, direction)
 
             # If this direction is already final, leave it alone.
             if os.path.exists(done_path):
@@ -240,11 +239,10 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
                     fh.write(json.dumps(task.data, ensure_ascii=False) + "\n")
 
             self._n_written += len(group)
-            self._seen_counts[handle_key] = self._seen_counts.get(handle_key, 0) + len(group)
+            self._seen_counts[hkey] = self._seen_counts.get(hkey, 0) + len(group)
 
-            direction = handle_key.rsplit("_", 1)[1]
             expected = group[0]._metadata.get("direction_counts", {}).get(direction, -1)
-            if expected > 0 and self._seen_counts[handle_key] >= expected:
+            if expected > 0 and self._seen_counts[hkey] >= expected:
                 os.rename(out_path, done_path)
                 self._n_directions_completed += 1
                 logger.info(
