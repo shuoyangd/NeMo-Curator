@@ -429,17 +429,11 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 use_tqdm=False,
             )
 
-            # Track per-task direction tallies so we can record one summary note.
-            per_task_total: dict[int, int] = {}
-            per_task_empty: dict[int, int] = {}
-
             for seq_idx, (task_idx, target_lang) in enumerate(prompt_owners):
                 task = tasks[task_idx]
                 translation = outputs[seq_idx].outputs[0].text.strip()
 
-                per_task_total[task_idx] = per_task_total.get(task_idx, 0) + 1
                 if not translation:
-                    per_task_empty[task_idx] = per_task_empty.get(task_idx, 0) + 1
                     logger.warning(
                         "LLMTranslation: empty translation for target={}", target_lang,
                     )
@@ -448,13 +442,6 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 translations[target_lang] = translation
                 task.data[self.translations_key] = translations
                 self._n_processed += 1
-
-            for task_idx, total in per_task_total.items():
-                empty = per_task_empty.get(task_idx, 0)
-                note = f"translated ({total - empty}/{total})"
-                if empty:
-                    note = f"{note}, {empty} empty"
-                set_note(tasks[task_idx].data, self.name, note, self.notes_key)
 
         logger.debug("LLMTranslation: batch of {} tasks ({} translations)", len(tasks), len(prompts))
         return tasks
