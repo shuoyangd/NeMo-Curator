@@ -197,14 +197,21 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
 
         max_num_batched_tokens = self.max_num_batched_tokens or max(self.max_model_len, 8192)
 
+        # enforce_eager skips torch.compile + CUDA-graph capture. Set
+        # VLLM_ENFORCE_EAGER=1 to avoid the graph-capture cost on every engine
+        # (re)spawn and the CUDA-graph-replay hang class that wedges the pipeline
+        # when Ray Data / Xenna tears down / respawns an actor mid-stream.
+        enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0").lower() in ("1", "true", "yes")
+
         logger.info(
             "LLMTranslation: loading {} (tp={}, max_model_len={}, "
-            "max_num_batched_tokens={}, kv_cache_dtype={})",
+            "max_num_batched_tokens={}, kv_cache_dtype={}, enforce_eager={})",
             self.model_id,
             self.tensor_parallel_size,
             self.max_model_len,
             max_num_batched_tokens,
             self.kv_cache_dtype,
+            enforce_eager,
         )
 
         self._llm = LLM(
@@ -218,7 +225,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             enable_prefix_caching=True,
             prefix_caching_hash_algo="xxhash",
             kv_cache_dtype=self.kv_cache_dtype,
-            enforce_eager=False,
+            enforce_eager=enforce_eager,
             seed=self.seed,
         )
         self._tokenizer = self._llm.get_tokenizer()
