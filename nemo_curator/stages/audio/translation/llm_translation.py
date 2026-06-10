@@ -111,11 +111,11 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     skip_me_key: str = "_skipme"
     notes_key: str = "additional_notes"
     tensor_parallel_size: int | None = None
-    max_output_tokens: int = 1024
-    max_model_len: int = 4096
-    max_num_seqs: int = 16
+    max_output_tokens: int = 256
+    max_model_len: int = 1024
+    max_num_seqs: int = 128
     max_num_batched_tokens: int | None = None
-    gpu_memory_utilization: float = 0.95
+    gpu_memory_utilization: float = 0.90
     kv_cache_dtype: str = "fp8"
     temperature: float = 0.7
     top_p: float = 0.8
@@ -127,7 +127,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     log_inputs: int = 5
     num_workers_override: int | None = None
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
-    batch_size: int = 64
+    batch_size: int = 256
 
     _llm: Any = field(default=None, init=False, repr=False)
     _tokenizer: Any = field(default=None, init=False, repr=False)
