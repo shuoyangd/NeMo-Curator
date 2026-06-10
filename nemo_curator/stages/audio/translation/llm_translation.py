@@ -124,7 +124,6 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     presence_penalty: float = 1.5
     repetition_penalty: float = 1.0
     seed: int = 1234
-    log_inputs: int = 5
     num_workers_override: int | None = None
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
     batch_size: int = 256
@@ -136,7 +135,6 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     _system_prompt: str | None = field(default=None, init=False, repr=False)
     _prompt_placeholders: frozenset[str] = field(default_factory=frozenset, init=False, repr=False)
     _n_processed: int = field(default=0, init=False, repr=False)
-    _n_inputs_logged: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.model_id:
@@ -423,10 +421,6 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 prompt = self._format_prompt(data, target_lang, source_lang)
                 prompts.append(prompt)
                 prompt_owners.append((task_idx, target_lang))
-
-                if self._n_inputs_logged < self.log_inputs:
-                    self._n_inputs_logged += 1
-                    logger.info("\nInput example {}: {}", self._n_inputs_logged, prompt)
 
         if prompts:
             outputs = self._llm.generate(
