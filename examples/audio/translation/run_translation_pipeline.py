@@ -83,6 +83,7 @@ import time
 from loguru import logger
 
 from nemo_curator.backends.xenna import XennaExecutor
+from nemo_curator.core.client import SlurmRayClient
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio.translation import (
     DirectionalShardedWriterStage,
@@ -193,6 +194,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="streaming",
         choices=["streaming", "batch"],
     )
+    ap.add_argument(
+        "--slurm",
+        action="store_true",
+        help=(
+            "Bootstrap a multi-node Ray cluster via SlurmRayClient. Launch the script on every "
+            "node (srun --ntasks-per-node=1): the head (SLURM_NODEID=0) runs the pipeline while "
+            "workers join the cluster and block until teardown. Omit for single-node runs."
+        ),
+    )
     return ap
 
 
@@ -244,13 +254,26 @@ def main() -> None:
     pipeline = Pipeline(name="translation_pipeline", stages=stages)
     logger.info("Pipeline:\n{}", pipeline.describe())
 
+    # Multi-node Ray bootstrap. With --slurm the script is launched on every node
+    # (srun --ntasks-per-node=1); SlurmRayClient elects the head from SLURM_NODEID,
+    # while worker nodes join the cluster and block inside start() until teardown
+    # (only the head returns here). XennaExecutor then connects via RAY_ADDRESS.
+    # Without --slurm, XennaExecutor manages its own single-node Ray as before.
+    ray_client = SlurmRayClient() if args.slurm else None
+    if ray_client is not None:
+        ray_client.start()
+
     t0 = time.time()
-    if all_shards_done(manifest_path=args.manifest, output_dir=args.output_dir):
-        logger.info("All shards are already complete — skipping pipeline.run().")
-    else:
-        executor = XennaExecutor(config={"execution_mode": args.execution_mode})
-        pipeline.run(executor=executor)
-        logger.info("Pipeline finished in {:.1f} min.", (time.time() - t0) / 60)
+    try:
+        if all_shards_done(manifest_path=args.manifest, output_dir=args.output_dir):
+            logger.info("All shards are already complete — skipping pipeline.run().")
+        else:
+            executor = XennaExecutor(config={"execution_mode": args.execution_mode})
+            pipeline.run(executor=executor)
+            logger.info("Pipeline finished in {:.1f} min.", (time.time() - t0) / 60)
+    finally:
+        if ray_client is not None:
+            ray_client.stop()
 
     logger.info(
         "Done. Output files (*.jsonl.done) are in: {}",
