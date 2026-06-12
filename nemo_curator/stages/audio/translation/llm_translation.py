@@ -376,7 +376,8 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         return self.process_batch([task])[0]
 
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
-        if not tasks:
+        # Ray Data may pass tasks as an ndarray, so use len() not `if not tasks`.
+        if len(tasks) == 0:
             return []
 
         if self._llm is None:

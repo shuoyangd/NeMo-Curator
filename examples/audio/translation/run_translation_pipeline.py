@@ -82,6 +82,7 @@ import time
 
 from loguru import logger
 
+from nemo_curator.backends.ray_data import RayDataExecutor
 from nemo_curator.backends.xenna import XennaExecutor
 from nemo_curator.core.client import SlurmRayClient
 from nemo_curator.pipeline import Pipeline
@@ -193,6 +194,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="streaming",
         choices=["streaming", "batch"],
+        help="Xenna execution mode. Ignored when --executor=ray_data (Ray Data manages its own scheduling).",
+    )
+    ap.add_argument(
+        "--executor",
+        type=str,
+        default="ray_data",
+        choices=["ray_data", "xenna"],
+        help="Pipeline executor backend. 'ray_data' uses RayDataExecutor; 'xenna' uses XennaExecutor.",
     )
     ap.add_argument(
         "--slurm",
@@ -268,7 +277,14 @@ def main() -> None:
         if all_shards_done(manifest_path=args.manifest, output_dir=args.output_dir):
             logger.info("All shards are already complete — skipping pipeline.run().")
         else:
-            executor = XennaExecutor(config={"execution_mode": args.execution_mode})
+            if args.executor == "ray_data":
+                # RayDataExecutor connects to the cluster SlurmRayClient bootstrapped
+                # (via RAY_ADDRESS) and ignores execution_mode — Ray Data manages its
+                # own streaming scheduling and backpressure.
+                executor = RayDataExecutor()
+            else:
+                executor = XennaExecutor(config={"execution_mode": args.execution_mode})
+            logger.info("Using executor: {}", type(executor).__name__)
             pipeline.run(executor=executor)
             logger.info("Pipeline finished in {:.1f} min.", (time.time() - t0) / 60)
     finally:
