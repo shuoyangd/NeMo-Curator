@@ -522,7 +522,17 @@ class SlurmRayClient(RayClient):
         logger.info(f"Ray worker starting: {' '.join(cmd)}")
         result = subprocess.run(cmd, check=False)  # noqa: S603
         logger.info(f"Ray worker exited with code {result.returncode}")
+        if result.returncode != 0 and self._head_shutdown_started():
+            logger.info("Ray worker observed head shutdown; treating worker exit as clean")
+            return 0
         return result.returncode
+
+    def _head_shutdown_started(self) -> bool:
+        """Return True if the head removed its shared port file during normal shutdown."""
+        slurm_job_id = os.environ.get("SLURM_JOB_ID")
+        if not slurm_job_id:
+            return False
+        return not os.path.exists(self._head_port_file(slurm_job_id))
 
     def _cleanup_local_ray(self) -> None:
         """Stop any stale Ray processes on the local node."""
