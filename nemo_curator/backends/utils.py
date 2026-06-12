@@ -199,6 +199,20 @@ def get_available_cpu_gpu_resources(
     return (available_cpus, available_gpus)
 
 
+def check_total_gpu_capacity(gpus_needed: int, *, ignore_head_node: bool = False) -> None:
+    """Raise if the cluster doesn't have enough GPUs to satisfy aggregate demand.
+
+    Ray placement-group admission (STRICT_PACK / STRICT_SPREAD) is the
+    authoritative gate, but it blocks indefinitely on ``pg.ready()`` when the
+    request can never be met. This pre-flight produces a clear error instead.
+    """
+    _, available_gpus = get_available_cpu_gpu_resources(ignore_head_node=ignore_head_node)
+    available = int(available_gpus)
+    if gpus_needed > available:
+        msg = f"Need {gpus_needed} GPUs but cluster has {available} available."
+        raise RuntimeError(msg)
+
+
 @ray.remote
 def _setup_stage_on_node(stage: ProcessingStage, node_info: NodeInfo, worker_metadata: WorkerMetadata) -> None:
     """Ray remote function to execute setup_on_node for a stage.

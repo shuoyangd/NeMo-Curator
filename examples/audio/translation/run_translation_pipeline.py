@@ -93,6 +93,7 @@ from nemo_curator.stages.audio.translation import (
     TranslationManifestReader,
     all_shards_done,
 )
+from nemo_curator.stages.audio.translation.remote_llm_translation import RemoteLLMTranslationStage
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -212,20 +213,166 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "workers join the cluster and block until teardown. Omit for single-node runs."
         ),
     )
+
+    # ------------------------------------------------------ Remote inference server
+    # When enabled, the translation stage sends OpenAI-compatible requests to one
+    # shared NVIDIA Dynamo (vLLM) server pool instead of loading an in-process
+    # engine. The stage actors become CPU-only HTTP clients, so GPU capacity is
+    # decoupled from the pipeline stage graph and many clients saturate the pool.
+    srv = ap.add_argument_group("remote inference server")
+    srv.add_argument(
+        "--use_inference_server",
+        action="store_true",
+        default=False,
+        help="Start a shared NVIDIA Dynamo (vLLM) InferenceServer and route the translation "
+        "stage to it as CPU-only HTTP clients. Without this flag, the stage runs in-process vLLM.",
+    )
+    srv.add_argument(
+        "--inference_served_model_name",
+        type=str,
+        default=None,
+        help="Model name sent as 'model=' in requests. Defaults to --model_id.",
+    )
+    srv.add_argument("--inference_api_key", type=str, default="EMPTY", help="API key forwarded to the server.")
+    srv.add_argument(
+        "--inference_max_replicas",
+        type=int,
+        default=0,
+        help="Number of Dynamo vLLM worker replicas. 0 = auto (cluster GPUs // inference_server_tp).",
+    )
+    srv.add_argument(
+        "--inference_server_tp",
+        type=int,
+        default=1,
+        help="tensor_parallel_size per server replica. Default 1 (many small replicas for throughput).",
+    )
+    srv.add_argument("--inference_port", type=int, default=8000, help="Server HTTP port.")
+    srv.add_argument(
+        "--inference_max_concurrent_requests",
+        type=int,
+        default=64,
+        help="Max in-flight requests per stage actor (async client semaphore bound).",
+    )
+    srv.add_argument("--inference_request_timeout", type=int, default=120, help="Per-request timeout (seconds).")
+    srv.add_argument(
+        "--inference_health_timeout",
+        type=int,
+        default=600,
+        help="Seconds to wait for the inference server to become healthy before failing.",
+    )
     return ap
+
+
+def _start_inference_server(args: argparse.Namespace):
+    """Start a shared NVIDIA Dynamo (vLLM) server and return (server, base_url, model_name).
+
+    Assumes a Ray cluster is already up (SlurmRayClient/RayClient). Lays the
+    workers out as many small replicas: tensor_parallel_size=inference_server_tp
+    (default 1), num_replicas = cluster GPUs // tp unless overridden.
+    """
+    import ray
+
+    from nemo_curator.core.serve import DynamoServerConfig, DynamoVLLMModelConfig, InferenceServer
+
+    if not ray.is_initialized():
+        ray.init(address=os.environ.get("RAY_ADDRESS", "auto"), ignore_reinit_error=True)
+    total_gpus = int(ray.cluster_resources().get("GPU", 0))
+
+    server_tp = args.inference_server_tp or 1
+    num_replicas = args.inference_max_replicas or max(1, total_gpus // server_tp)
+    logger.info(
+        "Inference server: {} replicas x TP={} (cluster GPUs={})", num_replicas, server_tp, total_gpus
+    )
+
+    engine_kwargs = {
+        "tensor_parallel_size": server_tp,
+        "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_num_seqs,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "kv_cache_dtype": args.kv_cache_dtype,
+        "trust_remote_code": True,
+    }
+    if server_tp == 1:
+        # TP=1: use the uniprocessor executor so each replica skips
+        # torch.distributed init (no TCPStore / rendezvous port) — important
+        # when packing many single-GPU replicas onto one node.
+        engine_kwargs["distributed_executor_backend"] = "uni"
+
+    model_cfg = DynamoVLLMModelConfig(
+        model_identifier=args.model_id,
+        model_name=args.inference_served_model_name,
+        engine_kwargs=engine_kwargs,
+        num_replicas=num_replicas,
+    )
+    server = InferenceServer(
+        models=[model_cfg],
+        backend=DynamoServerConfig(),
+        port=args.inference_port,
+        health_check_timeout_s=args.inference_health_timeout,
+    )
+    server.start()
+    # endpoint/port are finalized during start() (Dynamo binds to the infra node
+    # IP and may reallocate the port), so read them after.
+    return server, server.endpoint, model_cfg.resolved_model_name
 
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
 
-    stages = [
-        TranslationManifestReader(
-            manifest_path=args.manifest,
-            output_dir=args.output_dir,
-            target_lang_codes=args.target_langs,
-            source_lang_key=args.source_lang_code_key,
-        ),
-        LLMTranslationStage(
+    # Multi-node Ray bootstrap. With --slurm the script is launched on every node
+    # (srun --ntasks-per-node=1); SlurmRayClient elects the head from SLURM_NODEID,
+    # while worker nodes join the cluster and block inside start() until teardown
+    # (only the head returns here). The executor then connects via RAY_ADDRESS.
+    # Without --slurm, the executor manages its own single-node Ray as before.
+    ray_client = SlurmRayClient() if args.slurm else None
+    if ray_client is not None:
+        ray_client.start()
+
+    # Optional shared Dynamo inference server. Started AFTER the cluster is up so
+    # its replicas deploy across all nodes; the translation stage then routes to
+    # it as CPU-only HTTP clients instead of loading in-process vLLM.
+    inference_server = None
+    remote_base_url = None
+    remote_model_name = None
+    if args.use_inference_server:
+        if ray_client is None:
+            # No Slurm: stand up a local single-node Ray cluster for the server.
+            import torch
+
+            from nemo_curator.core.client import RayClient
+
+            ray_client = RayClient(num_gpus=torch.cuda.device_count())
+            ray_client.start()
+        inference_server, remote_base_url, remote_model_name = _start_inference_server(args)
+        logger.info("Routing translation to remote server at {} (model={})", remote_base_url, remote_model_name)
+
+    if remote_base_url:
+        translation_stage = RemoteLLMTranslationStage(
+            model_id=args.model_id,
+            translation_prompt=args.translation_prompt,
+            translation_prompt_file=args.translation_prompt_file,
+            system_prompt=args.system_prompt,
+            system_prompt_file=args.system_prompt_file,
+            text_key=args.text_key,
+            skip_me_key=args.skip_me_key,
+            max_output_tokens=args.max_output_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            min_p=args.min_p,
+            presence_penalty=args.presence_penalty,
+            repetition_penalty=args.repetition_penalty,
+            seed=args.seed,
+            num_workers_override=args.num_workers,
+            batch_size=args.batch_size,
+            inference_base_url=remote_base_url,
+            served_model_name=remote_model_name,
+            inference_api_key=args.inference_api_key,
+            max_concurrent_requests=args.inference_max_concurrent_requests,
+            request_timeout=args.inference_request_timeout,
+        )
+    else:
+        translation_stage = LLMTranslationStage(
             model_id=args.model_id,
             translation_prompt=args.translation_prompt,
             translation_prompt_file=args.translation_prompt_file,
@@ -249,7 +396,16 @@ def main() -> None:
             repetition_penalty=args.repetition_penalty,
             seed=args.seed,
             batch_size=args.batch_size,
+        )
+
+    stages = [
+        TranslationManifestReader(
+            manifest_path=args.manifest,
+            output_dir=args.output_dir,
+            target_lang_codes=args.target_langs,
+            source_lang_key=args.source_lang_code_key,
         ),
+        translation_stage,
         TranslationExpanderStage(
             source_lang_key=args.source_lang_code_key,
         ),
@@ -262,15 +418,6 @@ def main() -> None:
 
     pipeline = Pipeline(name="translation_pipeline", stages=stages)
     logger.info("Pipeline:\n{}", pipeline.describe())
-
-    # Multi-node Ray bootstrap. With --slurm the script is launched on every node
-    # (srun --ntasks-per-node=1); SlurmRayClient elects the head from SLURM_NODEID,
-    # while worker nodes join the cluster and block inside start() until teardown
-    # (only the head returns here). XennaExecutor then connects via RAY_ADDRESS.
-    # Without --slurm, XennaExecutor manages its own single-node Ray as before.
-    ray_client = SlurmRayClient() if args.slurm else None
-    if ray_client is not None:
-        ray_client.start()
 
     t0 = time.time()
     try:
@@ -288,6 +435,10 @@ def main() -> None:
             pipeline.run(executor=executor)
             logger.info("Pipeline finished in {:.1f} min.", (time.time() - t0) / 60)
     finally:
+        # Stop the server before the Ray client: the Dynamo backend re-enters the
+        # cluster to tear down its actors/PGs, so the cluster must still be up.
+        if inference_server is not None:
+            inference_server.stop()
         if ray_client is not None:
             ray_client.stop()
 
