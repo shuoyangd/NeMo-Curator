@@ -154,6 +154,13 @@ translation_metrics = [
     "sacrebleu>=2.6.0",
 ]
 
+translation_qe = [
+    "nemo_curator[translation_common]",
+    "pymarian",
+    "setuptools>=80.10.1,<81",
+    "unbabel-comet",
+]
+
 translation_segmentation = [
     "nemo_curator[translation_common]",
     "spacy>=3.8",
@@ -318,6 +325,32 @@ managed = true
 default-groups = ["dev", "test"]
 index-strategy = "unsafe-best-match"
 no-build-isolation-package = ["flash-attn"]
+conflicts = [
+    [
+        { extra = "translation_qe" },
+        { extra = "all" },
+    ],
+    [
+        { extra = "translation_qe" },
+        { extra = "audio_common" },
+    ],
+    [
+        { extra = "translation_qe" },
+        { extra = "audio_cpu" },
+    ],
+    [
+        { extra = "translation_qe" },
+        { extra = "audio_cuda12" },
+    ],
+    [
+        { extra = "translation_qe" },
+        { extra = "sdg_cpu" },
+    ],
+    [
+        { extra = "translation_qe" },
+        { extra = "sdg_cuda12" },
+    ],
+]
 constraint-dependencies = [
     "aiohttp>=3.13.3", # Addresses CVE GHSA-6mq8-rvhq-8wgg
     "cryptography>=46.0.6", # Address CVE GHSA-m959-cc7f-wv43
