@@ -26,10 +26,11 @@ from __future__ import annotations
 import glob as _glob
 import json
 import os
-from pathlib import Path
 
 import pandas as pd
 from loguru import logger
+
+from nemo_curator.stages.audio.translation.manifest_reader import _derive_input_root, _relative_shard_key
 
 
 def _discover_manifests(manifest: str | list[str]) -> list[str]:
@@ -80,7 +81,9 @@ def ingest_manifests(
         ambiguity (e.g. ``open(path).readlines()[line_index]``).
     ``_source_dataset``
         Dataset name: the value of ``source_dataset_key`` when present in the
-        row, otherwise the file's stem.
+        row, otherwise the manifest's path relative to the common input root
+        (extension stripped, e.g. ``sourceA/manifest_0``). Using the relative
+        path keeps same-stem manifests in different subfolders distinct.
     ``source_lang``
         Source language ISO code (value of ``source_lang_key``).
     ``_text``
@@ -104,7 +107,7 @@ def ingest_manifests(
         JSONL field containing the ISO language code (default: ``source_lang``).
     source_dataset_key:
         Optional JSONL field to use as the dataset name. When absent or not
-        present in a row, the file stem is used instead.
+        present in a row, the manifest's relative path is used instead.
     skip_me_key:
         JSONL field that marks rows to skip (default: ``_skipme``).
 
@@ -119,11 +122,15 @@ def ingest_manifests(
         logger.warning("ingest_manifests: no JSONL files found for manifest={}", manifest)
         return pd.DataFrame(columns=["_manifest_path", "_line_index", "_source_dataset", "source_lang", "_text"])
 
+    # Common input root so each manifest's source label is its relative path
+    # (extension stripped), keeping same-stem files in different subfolders distinct.
+    input_root = _derive_input_root(manifest)
+
     records: list[dict] = []
     total_skipped = 0
 
     for filepath in paths:
-        stem = Path(filepath).stem
+        default_dataset = _relative_shard_key(filepath, input_root)
         file_skipped = 0
         file_kept = 0
 
@@ -153,7 +160,7 @@ def ingest_manifests(
                     file_skipped += 1
                     continue
 
-                dataset = row.get(source_dataset_key, stem) if source_dataset_key else stem
+                dataset = row.get(source_dataset_key, default_dataset) if source_dataset_key else default_dataset
 
                 records.append(
                     {
