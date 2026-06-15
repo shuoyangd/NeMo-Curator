@@ -83,6 +83,9 @@ def _allocate(bucket_sizes: dict[str, int], quota: int) -> dict[str, int]:
 
         allocation.update(capped)
         if not uncapped:
+            break
+        if not capped:
+            # No bucket exceeded its size — proportional split is final.
             allocation.update(uncapped)
             break
 
