@@ -41,11 +41,12 @@ Pipeline
 
 Output
 ------
-``{output_dir}/{output_file}``
-    One JSONL line per selected row containing only the back-reference:
-    ``{"_manifest_path": "...", "_line_index": 42}``.
-    The translation pipeline can feed this file directly as ``--manifest``
-    because its reader reconstructs the full record from the original file.
+``{output_dir}/{relative_manifest_path}``
+    One output JSONL per source manifest, mirroring the input subdirectory
+    hierarchy so same-stem files in different subfolders don't collide
+    (e.g. ``en/manifest_0.jsonl`` and ``de/manifest_0.jsonl`` stay separate).
+    Each line contains the five fields needed by downstream pipelines:
+    ``{"_manifest_path": "...", "_line_index": 42, "pnc_text": "...", "length": 11, "source_lang": "en"}``.
 
 ``{output_dir}/sampling_stats.json``
     Machine-readable per-bucket and per-language stats:
@@ -59,8 +60,8 @@ Example
         --manifest /data/manifests \\
         --output_dir /data/sampled \\
         --language_quotas "en:10000,fr:5000,de:8000" \\
-        --length_ranges "1:15,16:30,31:45" \\
-        --max_words 45
+        --length_ranges "1:50,51:100,101:150,151:200,201:250,251:300" \\
+        --max_chars 300
 """
 
 from __future__ import annotations
@@ -73,6 +74,7 @@ from loguru import logger
 
 from nemo_curator.stages.audio.sampling import assign_buckets, ingest_manifests, proportional_sample, write_stats
 from nemo_curator.stages.audio.sampling.bucketing import parse_length_ranges
+from nemo_curator.stages.audio.translation.manifest_reader import _derive_input_root
 
 
 def _parse_language_quotas(spec: str) -> dict[str, int]:
@@ -107,13 +109,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--output_dir",
         type=str,
         required=True,
-        help="Output directory for sampled.jsonl and sampling_stats.json.",
-    )
-    ap.add_argument(
-        "--output_file",
-        type=str,
-        default="sampled.jsonl",
-        help="Name of the output JSONL index file.",
+        help=(
+            "Output directory. One JSONL per source manifest is written here, "
+            "preserving the input subdirectory hierarchy. sampling_stats.json "
+            "is also written here."
+        ),
     )
 
     # ------------------------------------------------------------------ Field keys
@@ -153,17 +153,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--length_ranges",
         type=str,
-        default="1:15,16:30,31:45",
+        default="1:50,51:100,101:150,151:200,201:250,251:300",
         help=(
-            "Comma-separated word-count brackets as 'min:max' pairs (inclusive). "
-            "E.g. '1:15,16:30,31:45'. Rows not covered by any bracket are discarded."
+            "Comma-separated character-count brackets as 'min:max' pairs (inclusive). "
+            "E.g. '1:50,51:100,101:150'. Rows not covered by any bracket are discarded."
         ),
     )
     ap.add_argument(
-        "--max_words",
+        "--max_chars",
         type=int,
-        default=45,
-        help="Discard transcripts with more than this many words.",
+        default=300,
+        help="Discard transcripts with more than this many characters.",
     )
 
     # ------------------------------------------------------------------ Sampling
@@ -198,7 +198,7 @@ def main() -> None:
     logger.info("  manifest      : {}", args.manifest)
     logger.info("  output_dir    : {}", args.output_dir)
     logger.info("  length_ranges : {}", length_ranges)
-    logger.info("  max_words     : {}", args.max_words)
+    logger.info("  max_chars     : {}", args.max_chars)
     logger.info("  language_quotas: {}", language_quotas)
     logger.info("  seed          : {}", args.seed)
 
@@ -215,20 +215,38 @@ def main() -> None:
         return
 
     # Step 2: bucket assignment.
-    df = assign_buckets(df, length_ranges=length_ranges, max_words=args.max_words)
+    df = assign_buckets(df, length_ranges=length_ranges, max_chars=args.max_chars)
     if df.empty:
-        logger.error("No rows remain after bucketing — check --length_ranges and --max_words.")
+        logger.error("No rows remain after bucketing — check --length_ranges and --max_chars.")
         return
 
     # Step 3: proportional sampling.
     sampled_df, stats = proportional_sample(df, language_quotas=language_quotas, seed=args.seed)
 
-    # Step 4: write output JSONL (back-references only).
-    output_jsonl = os.path.join(args.output_dir, args.output_file)
-    with open(output_jsonl, "w", encoding="utf-8") as fh:
-        for _, row in sampled_df[["_manifest_path", "_line_index"]].iterrows():
-            fh.write(json.dumps({"_manifest_path": row["_manifest_path"], "_line_index": int(row["_line_index"])}) + "\n")
-    logger.info("Output written to {} ({} rows)", output_jsonl, len(sampled_df))
+    # Step 4: write one output JSONL per source manifest, preserving the input
+    # subdirectory hierarchy so same-stem files in different subfolders don't collide.
+    input_root = _derive_input_root(args.manifest)
+    total_written = 0
+    for manifest_path, group in sampled_df.groupby("_manifest_path"):
+        if input_root:
+            rel = os.path.relpath(manifest_path, input_root)
+        else:
+            rel = os.path.basename(manifest_path)
+        output_path = os.path.join(args.output_dir, rel)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as fh:
+            for _, row in group.iterrows():
+                record = {
+                    "_manifest_path": row["_manifest_path"],
+                    "_line_index": int(row["_line_index"]),
+                    args.text_key: row["_text"],
+                    "length": int(row["_char_count"]),
+                    "source_lang": row["source_lang"],
+                }
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        logger.info("wrote {} rows -> {}", len(group), output_path)
+        total_written += len(group)
+    logger.info("Total written: {} rows across {} manifests", total_written, sampled_df["_manifest_path"].nunique())
 
     # Step 5: write stats.
     stats_path = os.path.join(args.output_dir, "sampling_stats.json")

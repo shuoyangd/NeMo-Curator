@@ -165,3 +165,7 @@ fern/product-docs/
 
 # PDF parsing data (symlinked to external storage)
 pdf_parsing/
+
+# Local-only SLURM launch scripts (not for the repo)
+run.sh
+run_sampling.sh

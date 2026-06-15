@@ -15,7 +15,7 @@
 """Bucket assignment for the sampling pipeline.
 
 Each row is assigned to a ``(source_lang × _source_dataset × length_range)``
-bucket. Rows whose word count exceeds ``max_words`` or falls outside all
+bucket. Rows whose character count exceeds ``max_chars`` or falls outside all
 defined length ranges are discarded.
 """
 
@@ -39,7 +39,7 @@ def parse_length_ranges(spec: str) -> list[tuple[int, int]]:
 
     Returns
     -------
-    List of ``(min_words, max_words)`` tuples sorted by ``min_words``.
+    List of ``(min_chars, max_chars)`` tuples sorted by ``min_chars``.
     """
     ranges: list[tuple[int, int]] = []
     for part in spec.split(","):
@@ -62,21 +62,21 @@ def _range_label(lo: int, hi: int) -> str:
 def assign_buckets(
     df: pd.DataFrame,
     length_ranges: list[tuple[int, int]],
-    max_words: int,
+    max_chars: int,
 ) -> pd.DataFrame:
     """Assign each row to a ``(source_lang × _source_dataset × length_range)`` bucket.
 
     Adds two new columns to the returned DataFrame:
 
-    ``_word_count``
-        Number of whitespace-separated tokens in the transcript.
+    ``_char_count``
+        Number of characters in the transcript.
     ``_bucket_key``
         String key of the form ``"{source_lang}|{_source_dataset}|{length_range}"``,
-        e.g. ``"en|librispeech|16-30"``.
+        e.g. ``"en|librispeech|101-150"``.
 
     Rows discarded:
-    * Word count > ``max_words``.
-    * Word count not covered by any range in ``length_ranges``.
+    * Character count > ``max_chars``.
+    * Character count not covered by any range in ``length_ranges``.
 
     Parameters
     ----------
@@ -84,36 +84,36 @@ def assign_buckets(
         DataFrame produced by :func:`ingest_manifests`.  Must have columns
         ``source_lang``, ``_source_dataset``, ``_text``.
     length_ranges:
-        Sorted list of ``(min_words, max_words)`` tuples (inclusive bounds).
+        Sorted list of ``(min_chars, max_chars)`` tuples (inclusive bounds).
         Produced by :func:`parse_length_ranges`.
-    max_words:
-        Hard upper limit. Rows with more words are discarded before range
+    max_chars:
+        Hard upper limit. Rows with more characters are discarded before range
         matching so oversized transcripts never inflate any bucket.
 
     Returns
     -------
-    pd.DataFrame with the same columns as ``df`` plus ``_word_count`` and
+    pd.DataFrame with the same columns as ``df`` plus ``_char_count`` and
     ``_bucket_key``, restricted to rows that fall within a valid range.
     """
     if df.empty:
-        return df.assign(_word_count=pd.Series(dtype=int), _bucket_key=pd.Series(dtype=str))
+        return df.assign(_char_count=pd.Series(dtype=int), _bucket_key=pd.Series(dtype=str))
 
     df = df.copy()
-    df["_word_count"] = df["_text"].str.split().str.len()
+    df["_char_count"] = df["_text"].str.len()
 
     before = len(df)
-    df = df[df["_word_count"] <= max_words]
+    df = df[df["_char_count"] <= max_chars]
     n_discarded_max = before - len(df)
     if n_discarded_max:
-        logger.info("assign_buckets: discarded {} rows exceeding max_words={}", n_discarded_max, max_words)
+        logger.info("assign_buckets: discarded {} rows exceeding max_chars={}", n_discarded_max, max_chars)
 
-    def _find_range(wc: int) -> str | None:
+    def _find_range(cc: int) -> str | None:
         for lo, hi in length_ranges:
-            if lo <= wc <= hi:
+            if lo <= cc <= hi:
                 return _range_label(lo, hi)
         return None
 
-    df["_length_range"] = df["_word_count"].map(_find_range)
+    df["_length_range"] = df["_char_count"].map(_find_range)
     n_out_of_range = df["_length_range"].isna().sum()
     if n_out_of_range:
         logger.info("assign_buckets: discarded {} rows not covered by any length range", n_out_of_range)
