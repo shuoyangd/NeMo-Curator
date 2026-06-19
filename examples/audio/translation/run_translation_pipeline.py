@@ -1,0 +1,301 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""LLM-based translation pipeline (text-only, vLLM).
+
+Architecture
+------------
+::
+
+    TranslationManifestReader     (CPU, _EmptyTask → AudioTask)
+        Composite stage = FilePartitioningStage + per-file reader.
+        One input manifest == one shard.  For each row it resolves the
+        source_lang ISO code → display name, writes the per-row
+        translate_to list (En→X / X→En), and tags the AudioTask with
+        _metadata = {_shard_key, _shard_total, direction_counts}.
+        On resume, shards whose every expected direction is already
+        .done are skipped; partial .jsonl files are deleted so the
+        writer's append mode starts clean.
+
+    LLMTranslationStage           (GPU, AudioTask → AudioTask)
+        Batched vLLM inference; writes data["translations"]
+        as {display_name: translated_text}.
+
+    TranslationExpanderStage      (CPU, AudioTask → list[AudioTask])
+        Fan-out: one task per direction with flat schema
+        {text, source_lang, target_lang (ISO), translation}.
+
+    DirectionalShardedWriterStage (CPU, AudioTask → AudioTask)
+        Appends batched rows (grouped per (shard_key, direction)) to
+        {output_dir}/{shard_key}_{src}-{tgt}.jsonl; renames to .done
+        inline once the per-direction counter equals direction_counts
+        for that direction.  setup() recovers counters from disk so
+        actor restarts pick up where they left off.
+
+Final outputs land directly at::
+
+    {output_dir}/{shard_key}_{src}-{tgt}.jsonl.done
+
+where ``shard_key`` mirrors the input manifest path under the input root
+(subdirectories preserved), or is just the manifest stem for flat input —
+e.g. ``m1_en-de.jsonl.done``, ``m1_en-fr.jsonl.done``,
+``m2_en-de.jsonl.done``, …
+
+There is no ``shards/`` subdir and no separate reconciliation step — the
+writer's per-direction file *is* the final output.
+
+Resume behaviour
+----------------
+Re-running with the same ``--output_dir`` skips any shard whose expected
+direction ``.done`` files are all present.  Only failed or partial shards
+are re-processed.
+
+Example
+-------
+::
+
+    python run_translation_pipeline.py \\
+        --manifest /data/manifests \\
+        --output_dir /data/translations \\
+        --target_langs de fr ru ja \\
+        --model_id Qwen/Qwen3-8B
+"""
+
+import os
+
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+
+import argparse
+import time
+
+from loguru import logger
+
+from nemo_curator.backends.ray_data import RayDataExecutor
+from nemo_curator.backends.xenna import XennaExecutor
+from nemo_curator.core.client import SlurmRayClient
+from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.audio.translation import (
+    DirectionalShardedWriterStage,
+    LLMTranslationStage,
+    TranslationExpanderStage,
+    TranslationManifestReader,
+    all_shards_done,
+)
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="LLM translation pipeline (text-only, vLLM).")
+
+    # ------------------------------------------------------------------ I/O
+    ap.add_argument(
+        "--manifest",
+        type=str,
+        required=True,
+        help=(
+            "Path to JSONL manifest(s). Accepts a single file, a directory (scanned "
+            "recursively for *.jsonl/*.json), or a glob pattern. FilePartitioningStage "
+            "handles discovery. One file == one shard."
+        ),
+    )
+    ap.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help=(
+            "Output directory. Final per-(manifest, direction) files land directly here as "
+            "{stem}_{src}-{tgt}.jsonl.done — no shards/ subdir, no reconciliation step."
+        ),
+    )
+
+    # ------------------------------------------------------------------ Languages
+    ap.add_argument(
+        "--target_langs",
+        type=str,
+        nargs="+",
+        required=True,
+        help=(
+            "Target language ISO codes (e.g. 'de fr ru ja'). "
+            "TranslationManifestReader generates En→X and X→En pairs."
+        ),
+    )
+    ap.add_argument(
+        "--source_lang_code_key",
+        type=str,
+        default="source_lang",
+        help="Input manifest key holding the source language ISO code.",
+    )
+
+    # ------------------------------------------------------------------ Model
+    ap.add_argument(
+        "--model_id",
+        type=str,
+        required=True,
+        help="Translation LLM model ID.",
+    )
+
+    # Prompt overrides (mutually exclusive pairs)
+    tpg = ap.add_mutually_exclusive_group()
+    tpg.add_argument("--translation_prompt", type=str, default=None)
+    tpg.add_argument("--translation_prompt_file", type=str, default=None)
+
+    spg = ap.add_mutually_exclusive_group()
+    spg.add_argument("--system_prompt", type=str, default=None)
+    spg.add_argument("--system_prompt_file", type=str, default=None)
+
+    ap.add_argument("--text_key", type=str, default="pnc_text", help="Manifest key for source text.")
+    ap.add_argument(
+        "--skip_me_key",
+        type=str,
+        default="_skipme",
+        help=(
+            "Manifest key flagging rows to skip. When truthy (non-empty string or boolean True), "
+            "the row is kept but receives an empty translation instead of being sent to the LLM."
+        ),
+    )
+
+    # vLLM params
+    ap.add_argument("--tensor_parallel_size", type=int, default=None)
+    ap.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Explicit number of GPU worker replicas for the translation stage under Xenna.",
+    )
+    ap.add_argument("--batch_size", type=int, default=512)
+    ap.add_argument("--max_output_tokens", type=int, default=256)
+    ap.add_argument("--max_model_len", type=int, default=1024)
+    ap.add_argument("--max_num_seqs", type=int, default=512)
+    ap.add_argument("--max_num_batched_tokens", type=int, default=16384)
+    ap.add_argument("--gpu_memory_utilization", type=float, default=0.90)
+    ap.add_argument("--kv_cache_dtype", type=str, default="fp8")
+    ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--top_p", type=float, default=0.8)
+    ap.add_argument("--top_k", type=int, default=20)
+    ap.add_argument("--min_p", type=float, default=0.0)
+    ap.add_argument("--presence_penalty", type=float, default=1.5)
+    ap.add_argument("--repetition_penalty", type=float, default=1.0)
+    ap.add_argument("--seed", type=int, default=1234)
+
+    # ------------------------------------------------------------------ Executor
+    ap.add_argument(
+        "--execution_mode",
+        type=str,
+        default="streaming",
+        choices=["streaming", "batch"],
+        help="Xenna execution mode. Ignored when --executor=ray_data (Ray Data manages its own scheduling).",
+    )
+    ap.add_argument(
+        "--executor",
+        type=str,
+        default="ray_data",
+        choices=["ray_data", "xenna"],
+        help="Pipeline executor backend. 'ray_data' uses RayDataExecutor; 'xenna' uses XennaExecutor.",
+    )
+    ap.add_argument(
+        "--slurm",
+        action="store_true",
+        help=(
+            "Bootstrap a multi-node Ray cluster via SlurmRayClient. Launch the script on every "
+            "node (srun --ntasks-per-node=1): the head (SLURM_NODEID=0) runs the pipeline while "
+            "workers join the cluster and block until teardown. Omit for single-node runs."
+        ),
+    )
+    return ap
+
+
+def main() -> None:
+    args = _build_arg_parser().parse_args()
+
+    stages = [
+        TranslationManifestReader(
+            manifest_path=args.manifest,
+            output_dir=args.output_dir,
+            target_lang_codes=args.target_langs,
+            source_lang_key=args.source_lang_code_key,
+        ),
+        LLMTranslationStage(
+            model_id=args.model_id,
+            translation_prompt=args.translation_prompt,
+            translation_prompt_file=args.translation_prompt_file,
+            system_prompt=args.system_prompt,
+            system_prompt_file=args.system_prompt_file,
+            text_key=args.text_key,
+            skip_me_key=args.skip_me_key,
+            tensor_parallel_size=args.tensor_parallel_size,
+            num_workers_override=args.num_workers,
+            max_output_tokens=args.max_output_tokens,
+            max_model_len=args.max_model_len,
+            max_num_seqs=args.max_num_seqs,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            kv_cache_dtype=args.kv_cache_dtype,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            min_p=args.min_p,
+            presence_penalty=args.presence_penalty,
+            repetition_penalty=args.repetition_penalty,
+            seed=args.seed,
+            batch_size=args.batch_size,
+        ),
+        TranslationExpanderStage(
+            source_lang_key=args.source_lang_code_key,
+        ),
+        DirectionalShardedWriterStage(
+            output_dir=args.output_dir,
+            source_lang_key="source_lang",
+            target_lang_key="target_lang",
+        ),
+    ]
+
+    pipeline = Pipeline(name="translation_pipeline", stages=stages)
+    logger.info("Pipeline:\n{}", pipeline.describe())
+
+    # Multi-node Ray bootstrap. With --slurm the script is launched on every node
+    # (srun --ntasks-per-node=1); SlurmRayClient elects the head from SLURM_NODEID,
+    # while worker nodes join the cluster and block inside start() until teardown
+    # (only the head returns here). XennaExecutor then connects via RAY_ADDRESS.
+    # Without --slurm, XennaExecutor manages its own single-node Ray as before.
+    ray_client = SlurmRayClient() if args.slurm else None
+    if ray_client is not None:
+        ray_client.start()
+
+    t0 = time.time()
+    try:
+        if all_shards_done(manifest_path=args.manifest, output_dir=args.output_dir):
+            logger.info("All shards are already complete — skipping pipeline.run().")
+        else:
+            if args.executor == "ray_data":
+                # RayDataExecutor connects to the cluster SlurmRayClient bootstrapped
+                # (via RAY_ADDRESS) and ignores execution_mode — Ray Data manages its
+                # own streaming scheduling and backpressure.
+                executor = RayDataExecutor()
+            else:
+                executor = XennaExecutor(config={"execution_mode": args.execution_mode})
+            logger.info("Using executor: {}", type(executor).__name__)
+            pipeline.run(executor=executor)
+            logger.info("Pipeline finished in {:.1f} min.", (time.time() - t0) / 60)
+    finally:
+        if ray_client is not None:
+            ray_client.stop()
+
+    logger.info(
+        "Done. Output files (*.jsonl.done) are in: {}",
+        args.output_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()
