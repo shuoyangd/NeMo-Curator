@@ -29,11 +29,17 @@ JSONL or News Commentary rows
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import os
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
 
 import pandas as pd
 import requests
@@ -42,6 +48,8 @@ from loguru import logger
 from nemo_curator.backends.ray_data import RayDataExecutor
 from nemo_curator.core.client import RayClient, SlurmRayClient
 from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.audio.translation import LLMTranslationStage, TranslationExpanderStage, TranslationManifestReader
+from nemo_curator.stages.audio.translation.translation_utils import TRANSLATE_TO_KEY, TRANSLATIONS_KEY
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.filters.bitext import BitextScoreFilter, LengthRatioFilter
@@ -51,7 +59,7 @@ from nemo_curator.stages.text.filters.histogram import HistogramFilter
 from nemo_curator.stages.text.filters.qe import QualityEstimationFilter
 from nemo_curator.stages.text.io.writer.jsonl import JsonlWriter
 from nemo_curator.stages.text.modifiers import DocumentModifier, Modify
-from nemo_curator.tasks import DocumentBatch
+from nemo_curator.tasks import AudioTask, DocumentBatch
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
@@ -60,6 +68,9 @@ if TYPE_CHECKING:
 NEWS_COMMENTARY_ROWS_URL = "https://datasets-server.huggingface.co/rows"
 DEFAULT_NEWS_COMMENTARY_ROWS = 200
 MAX_LOGGED_OUTPUT_PATHS = 10
+TRANSLATION_MANIFEST_DIRNAME = "_translation_input"
+TRANSLATION_RESUME_DIRNAME = "_translation_resume"
+TRANSLATION_MANIFEST_FILENAME = "manifest.jsonl"
 QE_SCORE_FIELDS = {
     "comet-qe": "comet_qe_score",
     "cometoid-wmt23": "pymarian_qe_score",
@@ -204,6 +215,98 @@ class RegexSubstitutionModifier(DocumentModifier):
         return value.strip()
 
 
+@dataclass
+class DryRunTranslationStage(ProcessingStage[AudioTask, AudioTask]):
+    """Populate Davit's translations dict without loading vLLM."""
+
+    text_key: str = "src"
+    target_lang_key: str = TRANSLATE_TO_KEY
+    translations_key: str = TRANSLATIONS_KEY
+    skip_me_key: str = "_skipme"
+    name: str = "dry_run_translation"
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        return [], [self.text_key, self.target_lang_key, self.skip_me_key]
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return [], [self.translations_key]
+
+    def process(self, task: AudioTask) -> AudioTask:
+        return self.process_batch([task])[0]
+
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+        for task in tasks:
+            raw_targets = task.data.get(self.target_lang_key) or []
+            targets = [raw_targets] if isinstance(raw_targets, str) else list(raw_targets)
+            text = "" if task.data.get(self.skip_me_key, 0) else str(task.data.get(self.text_key, ""))
+            task.data[self.translations_key] = {target: text for target in targets}
+        return tasks
+
+
+@dataclass
+class TranslationAudioToDocumentBatchStage(ProcessingStage[AudioTask, DocumentBatch]):
+    """Convert expanded translation rows into DocumentBatch rows for bitext filters."""
+
+    dataset_name: str = "bitext_cleaning"
+    src_field: str = "src"
+    tgt_field: str = "tgt"
+    src_lang_field: str = "src_lang"
+    tgt_lang_field: str = "tgt_lang"
+    source_file_field: str = "source_file"
+    status_field: str = "translation_status"
+    error_field: str = "translation_error"
+    skip_field: str = "_skipme"
+    reason_field: str = "reason"
+    batch_size: int = 128
+    name: str = "translation_audio_to_document"
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        return [], [self.src_field, self.tgt_field, self.src_lang_field, self.tgt_lang_field]
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], [self.status_field, self.error_field, self.skip_field, self.reason_field]
+
+    def process(self, task: AudioTask) -> DocumentBatch:
+        return self._make_batch([self._row_from_task(task)])
+
+    def process_batch(self, tasks: list[AudioTask]) -> list[DocumentBatch]:
+        rows = [self._row_from_task(task) for task in tasks]
+        if not rows:
+            return []
+        return [self._make_batch(rows)]
+
+    def _row_from_task(self, task: AudioTask) -> dict[str, Any]:
+        row = dict(task.data)
+        row[self.src_field] = str(row.get(self.src_field, ""))
+        row[self.tgt_field] = str(row.get(self.tgt_field, ""))
+        row[self.src_lang_field] = str(row.get(self.src_lang_field, "")).lower()
+        row[self.tgt_lang_field] = str(row.get(self.tgt_lang_field, "")).lower()
+        row.setdefault(self.source_file_field, str(task._metadata.get("_shard_key", task.dataset_name or "translation_manifest")))
+        row.setdefault(self.error_field, "")
+        row.setdefault(self.skip_field, 0)
+        row.setdefault(self.reason_field, None)
+        row.setdefault(self.status_field, self._status_for_row(row))
+        return row
+
+    def _status_for_row(self, row: dict[str, Any]) -> str:
+        if row.get(self.skip_field):
+            return "skipped"
+        if str(row.get(self.tgt_field, "")).strip():
+            return "translated"
+        return "empty"
+
+    def _make_batch(self, rows: list[dict[str, Any]]) -> DocumentBatch:
+        row_ids = [str(row.get("id", idx)) for idx, row in enumerate(rows)]
+        digest = hashlib.sha1("\n".join(row_ids).encode("utf-8")).hexdigest()[:12]
+        source_files = sorted({str(row.get(self.source_file_field, self.dataset_name)) for row in rows})
+        return DocumentBatch(
+            task_id=f"{self.dataset_name}_translated_{digest}",
+            dataset_name=self.dataset_name,
+            data=pd.DataFrame(rows),
+            _metadata={"source_files": source_files},
+        )
+
+
 def expand_file_list(filename: str) -> list[str]:
     pattern = re.compile(r"(.*)_OP_(\d+)..(\d+)_CL_(.*)")
     match = pattern.match(filename)
@@ -323,6 +426,63 @@ def read_jsonl_records(paths: list[str], args: argparse.Namespace) -> list[dict[
     return pd.concat(frames, ignore_index=True).to_dict(orient="records")
 
 
+def normalize_translation_frame(df: pd.DataFrame, args: argparse.Namespace, source_name: str) -> pd.DataFrame:
+    src_field = resolve_text_field(df, args.src_field, ("src", "text", "pnc_text"), "src")
+    source_file = str(source_name)
+    ids = (
+        df["id"].astype(str)
+        if "id" in df.columns
+        else pd.Series([f"{Path(source_name).stem}:{idx}" for idx in range(len(df))], index=df.index)
+    )
+    source_files = (
+        df["source_file"].fillna(source_file).astype(str)
+        if "source_file" in df.columns
+        else pd.Series([source_file] * len(df), index=df.index)
+    )
+    skip_values = (
+        df["_skipme"].fillna(0)
+        if "_skipme" in df.columns
+        else pd.Series([0] * len(df), index=df.index)
+    )
+    records = pd.DataFrame(
+        {
+            "id": ids,
+            "src": df[src_field].fillna("").astype(str),
+            "src_lang": resolve_language_values(df, args.src_lang, ("src_lang", "source_lang"), "src_lang"),
+            "tgt_lang": resolve_language_values(df, args.tgt_lang, ("tgt_lang", "target_lang"), "tgt_lang"),
+            "source_file": source_files,
+            "_skipme": skip_values,
+        }
+    )
+    return records
+
+
+def read_translation_records(paths: list[str], args: argparse.Namespace) -> list[dict[str, Any]]:
+    frames = []
+    for path in paths:
+        df = pd.read_json(path, lines=True)
+        frames.append(normalize_translation_frame(df, args, path))
+
+    if not frames:
+        return []
+
+    return pd.concat(frames, ignore_index=True).to_dict(orient="records")
+
+
+def normalize_news_records_for_translation(records: list[dict[str, str]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": record["id"],
+            "src": record["src"],
+            "src_lang": record["src_lang"],
+            "tgt_lang": record["tgt_lang"],
+            "source_file": record["source_file"],
+            "_skipme": 0,
+        }
+        for record in records
+    ]
+
+
 def news_commentary_langs(args: argparse.Namespace) -> tuple[str, str]:
     config_langs = args.dataset_config.split("-")
     if len(config_langs) != 2:
@@ -429,6 +589,64 @@ def build_initial_tasks(args: argparse.Namespace) -> tuple[list[DocumentBatch], 
     logger.info(f"Prepared {len(records)} rows in {len(tasks)} DocumentBatch task(s)")
     logger.info(f"Using language pair {src_lang}-{tgt_lang}")
     return tasks, src_lang, tgt_lang
+
+
+def build_translation_records(args: argparse.Namespace) -> list[dict[str, Any]]:
+    if args.config:
+        paths = manifest_paths_from_config(args.config)
+        records = read_translation_records(paths, args)
+    elif args.input_jsonl:
+        records = read_translation_records(args.input_jsonl, args)
+    else:
+        records = normalize_news_records_for_translation(fetch_news_commentary_records(args))
+
+    records = limit_records(records, args.max_rows if args.input_jsonl or args.config else None)
+    return repeat_records(records, args.repeat)
+
+
+def translation_work_dir(args: argparse.Namespace) -> Path:
+    if args.translation_work_dir:
+        return Path(args.translation_work_dir)
+    output_dir = Path(args.output_dir)
+    return output_dir.parent / f"{output_dir.name}{TRANSLATION_MANIFEST_DIRNAME}"
+
+
+def write_translation_manifest(records: list[dict[str, Any]], args: argparse.Namespace) -> tuple[str, str]:
+    work_dir = translation_work_dir(args)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = work_dir / TRANSLATION_MANIFEST_FILENAME
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    resume_dir = work_dir / TRANSLATION_RESUME_DIRNAME
+    resume_dir.mkdir(parents=True, exist_ok=True)
+    return str(manifest_path), str(resume_dir)
+
+
+def prepare_translation_input(args: argparse.Namespace) -> tuple[str, str, str, str]:
+    records = build_translation_records(args)
+    if not records:
+        msg = "No input records were loaded for translation"
+        raise ValueError(msg)
+
+    src_lang = args.src_lang or str(records[0]["src_lang"])
+    tgt_lang = args.tgt_lang or str(records[0]["tgt_lang"])
+    manifest_path, resume_dir = write_translation_manifest(records, args)
+    logger.info(f"Prepared {len(records)} source rows for translation manifest {manifest_path}")
+    logger.info(f"Using language pair {src_lang}-{tgt_lang}")
+    return manifest_path, resume_dir, src_lang, tgt_lang
+
+
+def translation_reader_target_codes(src_lang: str, tgt_lang: str) -> list[str]:
+    src = src_lang.split("_", 1)[0].lower()
+    tgt = tgt_lang.split("_", 1)[0].lower()
+    if src == "en" and tgt != "en":
+        return [tgt]
+    if tgt == "en" and src != "en":
+        return [src]
+    msg = "Davit's translation reader supports English-centric pairs only; expected en->X or X->en"
+    raise ValueError(msg)
 
 
 def qe_cutoff_for_model(model_name: str, args: argparse.Namespace) -> float:
@@ -548,7 +766,81 @@ def add_qe_filters(pipeline: Pipeline, args: argparse.Namespace, output_fields: 
         pipeline.add_stage(qe_stage)
 
 
-def build_pipeline(args: argparse.Namespace, src_lang: str, tgt_lang: str) -> Pipeline:
+def add_translation_stages(
+    pipeline: Pipeline,
+    args: argparse.Namespace,
+    manifest_path: str,
+    resume_dir: str,
+    src_lang: str,
+    tgt_lang: str,
+) -> None:
+    pipeline.add_stage(
+        TranslationManifestReader(
+            manifest_path=manifest_path,
+            output_dir=resume_dir,
+            target_lang_codes=translation_reader_target_codes(src_lang, tgt_lang),
+            source_lang_key="src_lang",
+        )
+    )
+
+    if args.translation_dry_run:
+        pipeline.add_stage(
+            DryRunTranslationStage(text_key="src").with_(
+                resources=Resources(cpus=args.cpu_stage_cpus),
+                batch_size=args.translation_batch_size,
+            )
+        )
+    else:
+        pipeline.add_stage(
+            LLMTranslationStage(
+                model_id=args.translation_model_id,
+                translation_prompt=args.translation_prompt,
+                translation_prompt_file=args.translation_prompt_file,
+                system_prompt=args.translation_system_prompt,
+                system_prompt_file=args.translation_system_prompt_file,
+                text_key="src",
+                skip_me_key="_skipme",
+                tensor_parallel_size=args.translation_tensor_parallel_size,
+                num_workers_override=args.translation_num_workers,
+                max_output_tokens=args.translation_max_output_tokens,
+                max_model_len=args.translation_max_model_len,
+                max_num_seqs=args.translation_max_num_seqs,
+                max_num_batched_tokens=args.translation_max_num_batched_tokens,
+                gpu_memory_utilization=args.translation_gpu_memory_utilization,
+                kv_cache_dtype=args.translation_kv_cache_dtype,
+                temperature=args.translation_temperature,
+                top_p=args.translation_top_p,
+                top_k=args.translation_top_k,
+                min_p=args.translation_min_p,
+                presence_penalty=args.translation_presence_penalty,
+                repetition_penalty=args.translation_repetition_penalty,
+                seed=args.translation_seed,
+                batch_size=args.translation_batch_size,
+            )
+        )
+
+    pipeline.add_stage(
+        TranslationExpanderStage(
+            source_lang_key="src_lang",
+            target_lang_key="tgt_lang",
+            translation_key="tgt",
+        ).with_(resources=Resources(cpus=args.cpu_stage_cpus))
+    )
+    pipeline.add_stage(
+        TranslationAudioToDocumentBatchStage(
+            dataset_name=args.dataset_name,
+            batch_size=args.rows_per_task,
+        ).with_(resources=Resources(cpus=args.cpu_stage_cpus))
+    )
+
+
+def build_pipeline(
+    args: argparse.Namespace,
+    src_lang: str,
+    tgt_lang: str,
+    translation_manifest_path: str | None = None,
+    translation_resume_dir: str | None = None,
+) -> Pipeline:
     pipeline = Pipeline(
         name="bitext_cleaning_recipe",
         description="Canary/news-commentary-style bitext cleaning with Ray DocumentBatch stages",
@@ -567,6 +859,13 @@ def build_pipeline(args: argparse.Namespace, src_lang: str, tgt_lang: str) -> Pi
         "_skipme",
         "reason",
     ]
+
+    if args.translate:
+        if translation_manifest_path is None or translation_resume_dir is None:
+            msg = "Translation mode requires a prepared translation manifest"
+            raise ValueError(msg)
+        output_fields.extend(["translation_status", "translation_error"])
+        add_translation_stages(pipeline, args, translation_manifest_path, translation_resume_dir, src_lang, tgt_lang)
 
     add_field_marker(
         pipeline,
@@ -640,6 +939,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rows-per-task", type=int, default=128)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--output-mode", choices=["ignore", "overwrite", "append", "error"], default="overwrite")
+    parser.add_argument("--translate", action="store_true", help="Translate source-only rows before bitext filtering")
+    parser.add_argument("--translation-dry-run", action="store_true", help="Copy src to tgt without loading vLLM")
+    parser.add_argument("--translation-work-dir", help="Directory for the generated translation manifest and resume state")
+    parser.add_argument("--translation-model-id", default="Qwen/Qwen3.5-4B", help="vLLM model ID for translation")
+    parser.add_argument("--translation-prompt")
+    parser.add_argument("--translation-prompt-file")
+    parser.add_argument("--translation-system-prompt")
+    parser.add_argument("--translation-system-prompt-file")
+    parser.add_argument("--translation-tensor-parallel-size", type=int)
+    parser.add_argument("--translation-num-workers", type=int)
+    parser.add_argument("--translation-batch-size", type=int, default=512)
+    parser.add_argument("--translation-max-output-tokens", type=int, default=256)
+    parser.add_argument("--translation-max-model-len", type=int, default=1024)
+    parser.add_argument("--translation-max-num-seqs", type=int, default=512)
+    parser.add_argument("--translation-max-num-batched-tokens", type=int, default=16384)
+    parser.add_argument("--translation-gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--translation-kv-cache-dtype", default="fp8")
+    parser.add_argument("--translation-temperature", type=float, default=0.7)
+    parser.add_argument("--translation-top-p", type=float, default=0.8)
+    parser.add_argument("--translation-top-k", type=int, default=20)
+    parser.add_argument("--translation-min-p", type=float, default=0.0)
+    parser.add_argument("--translation-presence-penalty", type=float, default=1.5)
+    parser.add_argument("--translation-repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--translation-seed", type=int, default=1234)
     parser.add_argument("--min-words", type=int, default=4)
     parser.add_argument("--length-max-ratio", type=float, default=9.0)
     parser.add_argument("--cpu-stage-cpus", type=float, default=1.0)
@@ -676,8 +999,15 @@ def main() -> None:
 
     start_time = time.time()
     try:
-        initial_tasks, src_lang, tgt_lang = build_initial_tasks(args)
-        pipeline = build_pipeline(args, src_lang, tgt_lang)
+        translation_manifest_path = None
+        translation_resume_dir = None
+        if args.translate:
+            translation_manifest_path, translation_resume_dir, src_lang, tgt_lang = prepare_translation_input(args)
+            initial_tasks = None
+        else:
+            initial_tasks, src_lang, tgt_lang = build_initial_tasks(args)
+
+        pipeline = build_pipeline(args, src_lang, tgt_lang, translation_manifest_path, translation_resume_dir)
         logger.info(f"\n{pipeline.describe()}")
         results = pipeline.run(executor=RayDataExecutor(), initial_tasks=initial_tasks)
     finally:
