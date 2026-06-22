@@ -28,23 +28,23 @@ Architecture
         .done are skipped; partial .jsonl files are deleted so the
         writer's append mode starts clean.
 
-    build_source_prefilter_stages (CPU, AudioTask → AudioTask)  [opt-in]
-        Source-only mark-only filters (word count; histogram/fastText).
-        Set _skipme so LLMTranslationStage skips vLLM on rejected rows.
-
     LLMTranslationStage           (GPU, AudioTask → AudioTask)
         Batched vLLM inference; writes data["translations"]
-        as {display_name: translated_text}.
+        as {display_name: translated_text}.  Rows flagged
+        translation_skipme (from the input skip column) get an empty
+        translation without an LLM call.
 
     TranslationExpanderStage      (CPU, AudioTask → list[AudioTask])
         Fan-out: one task per direction with flat schema
         {text, source_lang, target_lang (ISO), translation}.
 
     build_bitext_filter_stages    (CPU/GPU, AudioTask → AudioTask)  [opt-in]
-        Bitext mark-only filters on (source, translation): tgt word
-        count, length ratio, histogram/fastText, QE, regex cleanup.
-        Rows are annotated (_skipme + additional_notes) but never
-        dropped, so the writer's per-direction .done counting holds.
+        Post-translation mark-only filters on (source, translation):
+        tgt character count, length ratio, histogram/fastText, QE,
+        tokenizer round-trip, regex cleanup, then a finalize step.
+        Rows are annotated (translation_skipme + additional_notes) but
+        never dropped, so the writer's per-direction .done counting holds.
+        (No source-side pre-translation filtering.)
 
     DirectionalShardedWriterStage (CPU, AudioTask → AudioTask)
         Appends batched rows (grouped per (shard_key, direction)) to
@@ -104,7 +104,6 @@ from nemo_curator.stages.audio.translation import (
     add_bitext_filter_args,
     all_shards_done,
     build_bitext_filter_stages,
-    build_source_prefilter_stages,
 )
 
 
@@ -242,8 +241,6 @@ def main() -> None:
             source_lang_key=args.source_lang_code_key,
             input_skip_key=args.skip_me_key,
         ),
-        # Source-only filters: mark _skipme so the LLM skips vLLM on rejected rows.
-        *build_source_prefilter_stages(args),
         LLMTranslationStage(
             model_id=args.nmt_model_id,
             translation_prompt=args.nmt_translation_prompt,

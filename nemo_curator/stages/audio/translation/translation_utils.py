@@ -43,7 +43,6 @@ if TYPE_CHECKING:
     from nemo_curator.stages.base import ProcessingStage
 
 JSONL_EXT = ".jsonl"
-DONE_EXT = ".jsonl.done"
 
 # Canonical row field holding the source-language ISO code. The reader copies the
 # manifest's source-lang column (whatever ``--source_lang_code_key`` names) into this
@@ -94,12 +93,12 @@ def parse_handle_key(relpath_no_ext: str) -> tuple[str, str] | None:
 
 
 # ----------------------------------------------------------------------------
-# Bitext filtering: CLI args + stage builders
+# Bitext filtering: CLI args + stage builder
 #
-# These compose the AudioTask-native marker stages from ``bitext_filters`` into
-# the pre-translation (source-only) and post-translation (bitext) filter blocks.
-# Heavy filter imports are function-local so importing this contract module
-# (done early by the reader/writer stages) stays cheap.
+# ``build_bitext_filter_stages`` composes the AudioTask-native marker stages from
+# ``bitext_filters`` into the post-translation filter block (placed between the
+# expander and the writer). Heavy filter imports are function-local so importing
+# this contract module (done early by the reader/writer stages) stays cheap.
 # ----------------------------------------------------------------------------
 
 # The translation field written by ``TranslationExpanderStage`` (its
@@ -130,26 +129,23 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
 
     Args are named ``<filter>_<param>`` and grouped per filter in ``--help``.
     Every filter is **opt-in** via a single ``store_true`` flag (no ``--no-*``
-    variants); per-side filters expose ``<filter>_src`` / ``<filter>_tgt``. With no
-    filter flags the pipeline only translates. All filters are mark-only: rows are
-    annotated (``_skipme`` + ``additional_notes``) but never dropped, so the
-    directional writer's ``.done`` counting is preserved.
+    variants). All filters run **post-translation** on the (source, translation)
+    pair — there is no source-side pre-translation filtering. With no filter flags
+    the pipeline only translates. All filters are mark-only: rows are annotated
+    (``_skipme`` + ``additional_notes``) but never dropped, so the directional
+    writer's ``.done`` counting is preserved.
     """
     shared = parser.add_argument_group("bitext filtering: resources")
     shared.add_argument("--cpu_stage_cpus", type=float, default=1.0, help="CPUs per CPU filter stage.")
 
     cc = parser.add_argument_group("bitext filtering: character count (cc)")
     cc.add_argument(
-        "--cc_src", action="store_true",
-        help="Enable the character-count filter on the source text, pre-translation (marks short sources skip).",
-    )
-    cc.add_argument(
         "--cc_tgt", action="store_true",
         help="Enable the character-count filter on the translation, post-translation.",
     )
     cc.add_argument(
         "--cc_min_chars", type=int, default=1,
-        help="Minimum Unicode characters to keep (src and tgt). CJK-safe (no word splitter).",
+        help="Minimum Unicode characters to keep in the translation. CJK-safe (no word splitter).",
     )
 
     lr = parser.add_argument_group("bitext filtering: length ratio")
@@ -164,10 +160,6 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
 
     hist = parser.add_argument_group("bitext filtering: histogram")
     hist.add_argument(
-        "--histogram_src", action="store_true",
-        help="Enable the NLLB histogram language check on the source, pre-translation.",
-    )
-    hist.add_argument(
         "--histogram_tgt", action="store_true",
         help="Enable the NLLB histogram language check on the translation, post-translation.",
     )
@@ -176,16 +168,12 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
 
     langid = parser.add_argument_group("bitext filtering: language id (fastText)")
     langid.add_argument(
-        "--langid_src", action="store_true",
-        help="Enable the fastText language-id check on the source, pre-translation. Requires --langid_model_path.",
-    )
-    langid.add_argument(
         "--langid_tgt", action="store_true",
         help="Enable the fastText language-id check on the translation, post-translation. Requires --langid_model_path.",
     )
     langid.add_argument(
         "--langid_model_path", type=str, default=None,
-        help="Path to a fastText langid model (required when --langid_src/--langid_tgt is enabled).",
+        help="Path to a fastText langid model (required when --langid_tgt is enabled).",
     )
     langid.add_argument("--langid_min_score", type=float, default=0.5)
 
@@ -233,81 +221,6 @@ def _require_fasttext_model(args: argparse.Namespace, flag_name: str, enabled: b
     if enabled and not args.langid_model_path:
         msg = f"{flag_name} requires --langid_model_path to be set"
         raise ValueError(msg)
-
-
-def build_source_prefilter_stages(args: argparse.Namespace) -> list[ProcessingStage]:
-    """Pre-translation, source-only markers placed between the reader and the LLM.
-
-    These set ``_skipme`` so ``LLMTranslationStage`` skips vLLM on rejected rows
-    (GPU savings). They score the source text under ``args.text_key`` and are
-    dispatched per row by the row's ``source_lang`` (so the right word splitter /
-    histogram / expected language is used for each direction).
-    """
-    from nemo_curator.stages.audio.translation.bitext_filters import (
-        AudioTaskFieldMarker,
-        AudioTaskMarkerChain,
-        CharCountFilter,
-    )
-
-    _require_fasttext_model(args, "--langid_src", args.langid_src)
-    cand = _candidate_langs(args)
-    markers: list[Any] = []
-
-    if args.cc_src:
-        # Character count (CJK-safe): language-agnostic, single filter (no per-lang dispatch).
-        markers.append(
-            AudioTaskFieldMarker(
-                filter_obj=CharCountFilter(min_chars=args.cc_min_chars),
-                text_key=args.text_key,
-                score_key="src_char_count_score",
-                name="src_char_count",
-            )
-        )
-
-    if args.histogram_src:
-        from nemo_curator.stages.text.filters.histogram import HistogramFilter
-
-        markers.append(
-            AudioTaskFieldMarker(
-                filters_by_lang={
-                    lang: HistogramFilter(
-                        lang=lang, threshold=args.histogram_threshold, cache_dir=args.histogram_cache_dir
-                    )
-                    for lang in cand
-                },
-                lang_key=_SOURCE_LANG_FIELD,
-                text_key=args.text_key,
-                score_key="src_histogram_score",
-                name="src_histogram",
-            )
-        )
-
-    if args.langid_src:
-        from nemo_curator.stages.text.filters.fasttext import FastTextLangId
-
-        # One FastTextLangId per candidate language (each loads the shared model
-        # file at setup(); the candidate set is small = en + target langs).
-        markers.append(
-            AudioTaskFieldMarker(
-                filters_by_lang={
-                    lang: FastTextLangId(
-                        model_path=args.langid_model_path,
-                        min_langid_score=args.langid_min_score,
-                        expected_lang=lang,
-                    )
-                    for lang in cand
-                },
-                lang_key=_SOURCE_LANG_FIELD,
-                text_key=args.text_key,
-                score_key="src_langid_score",
-                name="src_langid",
-            )
-        )
-
-    if not markers:
-        return []
-    # Fuse all source markers into one stage so a row is handed off once, not once per filter.
-    return [AudioTaskMarkerChain(markers=markers, name="source_filters").with_(resources=Resources(cpus=args.cpu_stage_cpus))]
 
 
 def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage]:
@@ -401,7 +314,8 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
     if markers:
         stages.append(AudioTaskMarkerChain(markers=markers, name="target_filters").with_(resources=cpu))
 
-    # QE is a separate batched (GPU) stage; regex cleanup runs on every row (incl. skipped).
+    # QE is a separate batched (GPU) stage; tokenizer round-trip and regex cleanup
+    # are separate CPU stages. All skip rows already marked translation_skipme.
     if args.qe:
         for idx, model_name in enumerate(args.qe_models):
             model_kwargs: dict[str, Any] = {}

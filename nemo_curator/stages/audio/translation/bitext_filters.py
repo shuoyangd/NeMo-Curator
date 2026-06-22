@@ -16,10 +16,12 @@
 
 These stages mark (never drop) rows, so the row count per ``(shard, direction)``
 stays equal to ``direction_counts`` and ``DirectionalShardedWriterStage`` can
-still rename each shard's ``.jsonl`` to ``.jsonl.done``. Marking sets the
-``_skipme`` boolean gate and records a per-stage reason via ``set_note`` into
-``additional_notes`` — the same convention ``LLMTranslationStage`` uses — so
-each filter's decision is queryable without string parsing.
+still rename each shard's ``.jsonl`` to ``.jsonl.done``. Each applied stage records
+an ``applied (...)`` note (with its score) via ``set_note`` into ``additional_notes``
+— the same convention ``LLMTranslationStage`` uses — and a rejected row also gets the
+working ``translation_skipme`` gate set (the gate carries the skip decision; the note
+carries the score). The score is kept only in the note, so no temporary score column
+is left on the row.
 
 Each marker reuses the existing string-level scoring objects
 (``DocumentFilter`` / ``BitextFilter`` from ``nemo_curator.stages.text.filters``)
@@ -187,8 +189,8 @@ class AudioTaskFieldMarker(ProcessingStage[AudioTask, AudioTask]):
       * fixed: pass ``filter_obj`` — every row scored with the same filter.
       * per-row language dispatch: pass ``filters_by_lang`` (``{lang_code:
         DocumentFilter}``) + ``lang_key``. Each row is scored with the filter for
-        its own ``_normalize_code(row[lang_key])``. This keeps language-aware
-        filters (word count splitter, histogram, fastText) correct across a
+        its own ``_normalize_code(row[lang_key])``. This keeps genuinely
+        language-specific filters (histogram, fastText) correct across a
         bidirectional run (en->X and X->en) where the source/target language
         varies per row. Rows whose language has no entry are left unscored.
 
@@ -366,7 +368,6 @@ class AudioTaskMarkerChain(ProcessingStage[AudioTask, AudioTask]):
 
     markers: list[Any] = field(default_factory=list)
     name: str = "marker_chain"
-    skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -394,8 +395,8 @@ class AudioTaskMarkerChain(ProcessingStage[AudioTask, AudioTask]):
 
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
         for task in tasks:
-            if _is_skipped(task, self.skip_key):
-                continue
+            # Each marker's apply_row short-circuits an already-skipped row (returns
+            # True), so the first marker breaks the loop — no separate skip check.
             for marker in self.markers:
                 if marker.apply_row(task):
                     break
@@ -510,8 +511,8 @@ class TokenizerRoundTripStage(ProcessingStage[AudioTask, AudioTask]):
     Per row it encodes ``text_key`` (no special tokens) and decodes back; if the
     decoded text differs from the original (the tokenizer can't faithfully
     represent it — e.g. characters map to <unk> or get dropped), the row is marked
-    ``_skipme=1`` with an ``additional_notes`` note. Mark-only; already-skipped
-    rows are left untouched.
+    ``translation_skipme=1`` with an ``additional_notes`` note. Mark-only;
+    already-skipped rows are left untouched.
     """
 
     model_id: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
