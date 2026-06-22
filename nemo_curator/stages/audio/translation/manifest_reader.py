@@ -55,6 +55,7 @@ from loguru import logger
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.audio.translation.language_map import LANGUAGE_MAP, _normalize_code, lang_code_to_name
 from nemo_curator.stages.audio.translation.translation_utils import (
+    SOURCE_LANG_CODE_KEY,
     SOURCE_LANG_NAME_KEY,
     TRANSLATE_TO_KEY,
     output_paths,
@@ -307,6 +308,9 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
                 if src_raw:
                     row[self.source_lang_name_key] = lang_code_to_name(src_raw)
+                # Canonicalize the source-lang code into a fixed key so downstream
+                # stages (filters, writer) don't depend on the input column name.
+                row[SOURCE_LANG_CODE_KEY] = src_raw
                 row[self.translate_to_key] = target_names
 
                 for tgt_norm in self._row_targets(src_norm):

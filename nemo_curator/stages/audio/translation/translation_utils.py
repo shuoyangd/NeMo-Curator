@@ -45,6 +45,12 @@ if TYPE_CHECKING:
 JSONL_EXT = ".jsonl"
 DONE_EXT = ".jsonl.done"
 
+# Canonical row field holding the source-language ISO code. The reader copies the
+# manifest's source-lang column (whatever ``--source_lang_code_key`` names) into this
+# fixed key, so every downstream stage (filters, writer) reads one stable field
+# regardless of the input column name.
+SOURCE_LANG_CODE_KEY = "source_lang"
+
 # Internal scratch keys (never appear in the output manifest).
 SOURCE_LANG_NAME_KEY = "source_lang_name"
 TRANSLATE_TO_KEY = "translate_to"
@@ -94,7 +100,7 @@ def parse_handle_key(relpath_no_ext: str) -> tuple[str, str] | None:
 # The translation field written by ``TranslationExpanderStage`` (its
 # ``translation_key`` default) and the lang keys the writer/QE read per row.
 _TRANSLATION_FIELD = "translation"
-_SOURCE_LANG_FIELD = "source_lang"
+_SOURCE_LANG_FIELD = SOURCE_LANG_CODE_KEY
 _TARGET_LANG_FIELD = "target_lang"
 
 QE_SCORE_FIELDS = {
@@ -118,12 +124,10 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
     """Add the bitext-filtering CLI args to the translation pipeline parser.
 
     Args are named ``<filter>_<param>`` and grouped per filter in ``--help``.
-    Per-side toggles are ``<filter>_src`` / ``<filter>_tgt`` (``--flag``/``--no-flag``):
-    word count (``--wc_src`` / ``--wc_tgt``, default on), histogram (default off),
-    langid (default off; needs ``--langid_model_path``). Length ratio
-    (``--length_ratio``, default on), QE (``--qe``), and regex cleanup
-    (``--regex_cleanup``, default on) are not per-side. All filters are mark-only:
-    rows are annotated (``_skipme`` + ``additional_notes``) but never dropped, so the
+    Every filter is **opt-in** via a single ``store_true`` flag (no ``--no-*``
+    variants); per-side filters expose ``<filter>_src`` / ``<filter>_tgt``. With no
+    filter flags the pipeline only translates. All filters are mark-only: rows are
+    annotated (``_skipme`` + ``additional_notes``) but never dropped, so the
     directional writer's ``.done`` counting is preserved.
     """
     shared = parser.add_argument_group("bitext filtering: resources")
@@ -131,42 +135,42 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
 
     wc = parser.add_argument_group("bitext filtering: word count (wc)")
     wc.add_argument(
-        "--wc_src", action=argparse.BooleanOptionalAction, default=True,
-        help="Word-count filter on the source text, pre-translation (marks short sources skip). Default: on.",
+        "--wc_src", action="store_true",
+        help="Enable the word-count filter on the source text, pre-translation (marks short sources skip).",
     )
     wc.add_argument(
-        "--wc_tgt", action=argparse.BooleanOptionalAction, default=True,
-        help="Word-count filter on the translation, post-translation. Default: on.",
+        "--wc_tgt", action="store_true",
+        help="Enable the word-count filter on the translation, post-translation.",
     )
     wc.add_argument("--wc_min_words", type=int, default=4, help="Minimum words to keep (src and tgt).")
 
     lr = parser.add_argument_group("bitext filtering: length ratio")
     lr.add_argument(
-        "--length_ratio", action=argparse.BooleanOptionalAction, default=True,
-        help="Length-ratio filter on the (source, translation) pair. Default: on.",
+        "--length_ratio", action="store_true",
+        help="Enable the length-ratio filter on the (source, translation) pair.",
     )
     lr.add_argument("--length_ratio_max", type=float, default=9.0, help="Max src/tgt length ratio.")
 
     hist = parser.add_argument_group("bitext filtering: histogram")
     hist.add_argument(
-        "--histogram_src", action=argparse.BooleanOptionalAction, default=False,
-        help="NLLB histogram language check on the source, pre-translation. Default: off.",
+        "--histogram_src", action="store_true",
+        help="Enable the NLLB histogram language check on the source, pre-translation.",
     )
     hist.add_argument(
-        "--histogram_tgt", action=argparse.BooleanOptionalAction, default=False,
-        help="NLLB histogram language check on the translation, post-translation. Default: off.",
+        "--histogram_tgt", action="store_true",
+        help="Enable the NLLB histogram language check on the translation, post-translation.",
     )
     hist.add_argument("--histogram_threshold", type=float, default=0.8)
     hist.add_argument("--histogram_cache_dir", type=str, default=None)
 
     langid = parser.add_argument_group("bitext filtering: language id (fastText)")
     langid.add_argument(
-        "--langid_src", action=argparse.BooleanOptionalAction, default=False,
-        help="fastText language-id check on the source, pre-translation. Requires --langid_model_path. Default: off.",
+        "--langid_src", action="store_true",
+        help="Enable the fastText language-id check on the source, pre-translation. Requires --langid_model_path.",
     )
     langid.add_argument(
-        "--langid_tgt", action=argparse.BooleanOptionalAction, default=False,
-        help="fastText language-id check on the translation, post-translation. Requires --langid_model_path. Default: off.",
+        "--langid_tgt", action="store_true",
+        help="Enable the fastText language-id check on the translation, post-translation. Requires --langid_model_path.",
     )
     langid.add_argument(
         "--langid_model_path", type=str, default=None,
@@ -175,10 +179,7 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
     langid.add_argument("--langid_min_score", type=float, default=0.5)
 
     qe = parser.add_argument_group("bitext filtering: quality estimation (QE)")
-    qe.add_argument(
-        "--qe", action=argparse.BooleanOptionalAction, default=False,
-        help="Enable COMET / Cometoid QE filtering. Default: off.",
-    )
+    qe.add_argument("--qe", action="store_true", help="Enable COMET / Cometoid QE filtering.")
     qe.add_argument("--qe_models", nargs="+", default=["cometoid-wmt23"], choices=sorted(QE_SCORE_FIELDS))
     qe.add_argument("--qe_mode", choices=["simple", "always_en_x", "bidi"], default="always_en_x")
     qe.add_argument("--qe_cpu", action="store_true", help="Run QE on CPU (avoids GPU contention with vLLM).")
@@ -189,12 +190,21 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
     qe.add_argument("--qe_pymarian_shard_size", type=int, default=5000)
     qe.add_argument("--qe_pymarian_args", type=str, default=None)
 
+    trt = parser.add_argument_group("bitext filtering: tokenizer round-trip")
+    trt.add_argument(
+        "--tokenizer_roundtrip", action="store_true",
+        help="Enable a tokenizer encode->decode round-trip check on the translation; mismatches are marked skip.",
+    )
+    trt.add_argument(
+        "--tokenizer_roundtrip_model", type=str, default="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        help="Model whose tokenizer is used for the round-trip check (tokenizer only; no model weights loaded).",
+    )
+
     regex = parser.add_argument_group("bitext filtering: regex cleanup")
     regex.add_argument(
-        "--regex_cleanup", action=argparse.BooleanOptionalAction, default=True,
-        help="Apply regex cleanup to the output text. Default: on. (Strips non-Latin/Cyrillic/Greek scripts.)",
+        "--regex_cleanup", action="store_true",
+        help="Enable regex cleanup of the translation output. (Strips non-Latin/Cyrillic/Greek scripts.)",
     )
-    regex.add_argument("--regex_cleanup_field", choices=["translation", "source"], default="translation")
 
 
 def _candidate_langs(args: argparse.Namespace) -> list[str]:
@@ -208,9 +218,17 @@ def _candidate_langs(args: argparse.Namespace) -> list[str]:
 
 
 def _lang_pairs(args: argparse.Namespace) -> list[tuple[str, str]]:
-    """Directed (src_lang, tgt_lang) pairs for per-row length-ratio dispatch."""
-    cand = _candidate_langs(args)
-    return [(src, tgt) for src in cand for tgt in cand if src != tgt]
+    """English-centric (src, tgt) pairs the reader actually emits: ``en->X`` and ``X->en``.
+
+    The reader is English-centric, so non-English pairs (``X->Y``) never occur;
+    building filters for them would be wasted work (and would pull in CJK
+    tokenizers for unused directions).
+    """
+    pairs: list[tuple[str, str]] = []
+    for x in sorted({_normalize_code(c) for c in args.target_langs} - {"en", ""}):
+        pairs.append(("en", x))
+        pairs.append((x, "en"))
+    return pairs
 
 
 def _require_fasttext_model(args: argparse.Namespace, flag_name: str, enabled: bool) -> None:
@@ -229,19 +247,21 @@ def build_source_prefilter_stages(args: argparse.Namespace) -> list[ProcessingSt
     histogram / expected language is used for each direction).
     """
     from nemo_curator.stages.audio.translation.bitext_filters import AudioTaskFieldMarker, AudioTaskMarkerChain
-    from nemo_curator.stages.text.filters.heuristic import WordCountFilter
+    
 
     _require_fasttext_model(args, "--langid_src", args.langid_src)
     cand = _candidate_langs(args)
     markers: list[Any] = []
 
     if args.wc_src:
+        from nemo_curator.stages.text.filters.heuristic import WordCountFilter
+        
         markers.append(
             AudioTaskFieldMarker(
                 filters_by_lang={lang: WordCountFilter(min_words=args.wc_min_words, lang=lang) for lang in cand},
                 lang_key=_SOURCE_LANG_FIELD,
                 text_key=args.text_key,
-                score_key="src_word_count",
+                score_key="src_word_count_score",
                 name="src_word_count",
             )
         )
@@ -259,7 +279,7 @@ def build_source_prefilter_stages(args: argparse.Namespace) -> list[ProcessingSt
                 },
                 lang_key=_SOURCE_LANG_FIELD,
                 text_key=args.text_key,
-                score_key="src_histogram",
+                score_key="src_histogram_score",
                 name="src_histogram",
             )
         )
@@ -281,7 +301,7 @@ def build_source_prefilter_stages(args: argparse.Namespace) -> list[ProcessingSt
                 },
                 lang_key=_SOURCE_LANG_FIELD,
                 text_key=args.text_key,
-                score_key="src_langid",
+                score_key="src_langid_score",
                 name="src_langid",
             )
         )
@@ -304,6 +324,7 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
         AudioTaskMarkerChain,
         AudioTaskQEMarker,
         AudioTaskRegexModifier,
+        TokenizerRoundTripStage,
     )
     from nemo_curator.stages.text.filters.bitext import LengthRatioFilter
     from nemo_curator.stages.text.filters.heuristic import WordCountFilter
@@ -322,7 +343,7 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                 filters_by_lang={lang: WordCountFilter(min_words=args.wc_min_words, lang=lang) for lang in cand},
                 lang_key=_TARGET_LANG_FIELD,
                 text_key=_TRANSLATION_FIELD,
-                score_key="tgt_word_count",
+                score_key="tgt_word_count_score",
                 name="tgt_word_count",
             )
         )
@@ -339,7 +360,7 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                 tgt_lang_key=_TARGET_LANG_FIELD,
                 src_key=args.text_key,
                 tgt_key=_TRANSLATION_FIELD,
-                score_key="length_ratio",
+                score_key="length_ratio_score",
                 name="length_ratio",
             )
         )
@@ -357,7 +378,7 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                 },
                 lang_key=_TARGET_LANG_FIELD,
                 text_key=_TRANSLATION_FIELD,
-                score_key="tgt_histogram",
+                score_key="tgt_histogram_score",
                 name="tgt_histogram",
             )
         )
@@ -377,14 +398,14 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                 },
                 lang_key=_TARGET_LANG_FIELD,
                 text_key=_TRANSLATION_FIELD,
-                score_key="tgt_langid",
+                score_key="tgt_langid_score",
                 name="tgt_langid",
             )
         )
 
-    stages: list[ProcessingStage] = [
-        AudioTaskMarkerChain(markers=markers, name="target_filters").with_(resources=cpu)
-    ]
+    stages: list[ProcessingStage] = []
+    if markers:
+        stages.append(AudioTaskMarkerChain(markers=markers, name="target_filters").with_(resources=cpu))
 
     # QE is a separate batched (GPU) stage; regex cleanup runs on every row (incl. skipped).
     if args.qe:
@@ -412,8 +433,15 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                 ).with_(resources=qe_resources, batch_size=args.qe_batch_size)
             )
 
+    # Tokenizer round-trip is a separate actor stage (loads a tokenizer in setup()).
+    if args.tokenizer_roundtrip:
+        stages.append(
+            TokenizerRoundTripStage(
+                model_id=args.tokenizer_roundtrip_model, text_key=_TRANSLATION_FIELD
+            ).with_(resources=cpu)
+        )
+
     if args.regex_cleanup:
-        cleanup_field = args.text_key if args.regex_cleanup_field == "source" else _TRANSLATION_FIELD
-        stages.append(AudioTaskRegexModifier(field_key=cleanup_field).with_(resources=cpu))
+        stages.append(AudioTaskRegexModifier(field_key=_TRANSLATION_FIELD).with_(resources=cpu))
 
     return stages

@@ -73,6 +73,12 @@ REGEX_PARAMS_LIST: list[dict[str, str]] = [
     {"pattern": r"\[[^\]]*\]", "repl": ""},
     {"pattern": r" ?\([^\)]+\)", "repl": ""},
     {"pattern": r" ?{[^}]+}", "repl": ""},
+    # WARNING — destructive and NOT script-aware: this negated character class keeps
+    # ONLY Latin/Cyrillic/Greek letters + digits/punctuation/currency and DELETES
+    # everything else. For a target in CJK/Arabic/Hebrew/Hangul/Devanagari/Thai it
+    # strips the whole translation -> "". Only safe for Latin/Cyrillic/Greek targets;
+    # disable regex cleanup (drop --regex_cleanup) for others. See translation_raw
+    # (AudioTaskRegexModifier) for the preserved pre-cleanup text.
     {
         "pattern": "[^ !$%',-.0123456789;?ABCDEFGHIJKLMNOPQRSßTUVWXYŸZabcdefghijklmnopqrsẞtuvwxyÿz¡£¿ÀÁÂÃÄÅÆÇÈÉÊÌÍÎÑÒÓÔÕÖØÙÚÜÝàáâãäåæçèéêëìíîïñòóôõöøùúûüýĀāĂăĄąĆćĊċČčĎďĐđĒēĖėĘęĚěĠġĢģĦħĪīĮįĶķĹĺĻļĽľŁłŃńŅņŇňŐőŒœŔŕŘřŚśŠšŤťŪūŮůŰűŲųŹźŻżŽžȘșȚțΆΈΉΌΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩάέήίαβγδεζηθικλμνξοπρστυφχψωϊόύώЁЄІЇАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяёєіїҐґ€₴₽/:]",
         "repl": "",
@@ -426,28 +432,94 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
 
 
 @dataclass
+class TokenizerRoundTripStage(ProcessingStage[AudioTask, AudioTask]):
+    """Mark rows whose text doesn't survive a tokenizer encode->decode round-trip.
+
+    Loads ONLY the tokenizer (no model weights) for ``model_id`` in ``setup()``.
+    Per row it encodes ``text_key`` (no special tokens) and decodes back; if the
+    decoded text differs from the original (the tokenizer can't faithfully
+    represent it — e.g. characters map to <unk> or get dropped), the row is marked
+    ``_skipme=1`` with an ``additional_notes`` note. Mark-only; already-skipped
+    rows are left untouched.
+    """
+
+    model_id: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    text_key: str = "translation"
+    name: str = "tokenizer_roundtrip"
+    skip_key: str = SKIP_KEY
+    notes_key: str = NOTES_KEY
+    trust_remote_code: bool = True
+    tokenizer: Any = None
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        return [], [self.text_key]
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return [], []
+
+    def ray_stage_spec(self) -> dict[str, Any]:
+        return {RayStageSpecKeys.IS_ACTOR_STAGE: True}
+
+    def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
+        from transformers import AutoTokenizer
+
+        # Tokenizer files only — no model weights are downloaded/loaded.
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=self.trust_remote_code)
+
+    def process(self, task: AudioTask) -> AudioTask:
+        return self.process_batch([task])[0]
+
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+        if self.tokenizer is None:
+            msg = "Tokenizer not initialised — setup() was not called"
+            raise RuntimeError(msg)
+        for task in tasks:
+            if _is_skipped(task, self.skip_key):
+                continue
+            text = str(task.data.get(self.text_key, "") or "")
+            if not text.strip():
+                continue
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
+            decoded = self.tokenizer.decode(ids, skip_special_tokens=True)
+            if decoded.strip() != text.strip():
+                _mark_skip(task, self.name, "tokenizer round-trip mismatch", self.notes_key, self.skip_key)
+        return tasks
+
+
+@dataclass
 class AudioTaskRegexModifier(ProcessingStage[AudioTask, AudioTask]):
-    """Apply the fixed ``REGEX_PARAMS_LIST`` cleanup to one text field per row."""
+    """Apply the fixed ``REGEX_PARAMS_LIST`` cleanup to one text field per row.
+
+    The cleanup overwrites ``field_key`` in place, but the original (pre-cleanup)
+    value is first preserved under ``raw_key`` (default ``"{field_key}_raw"``) so the
+    untouched text survives even when the destructive char-class rule empties or
+    mangles it.
+    """
 
     field_key: str = "translation"
+    raw_key: str = ""  # defaults to f"{field_key}_raw"
     regex_params: list[dict[str, str]] = field(default_factory=lambda: REGEX_PARAMS_LIST)
     name: str = "regex_cleanup"
 
     def __post_init__(self) -> None:
+        self.raw_key = self.raw_key or f"{self.field_key}_raw"
         self._modifier = RegexSubstitutionModifier(self.regex_params)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], [self.field_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.field_key]
+        return [], [self.field_key, self.raw_key]
 
     def process(self, task: AudioTask) -> AudioTask:
         return self.process_batch([task])[0]
 
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
         for task in tasks:
-            task.data[self.field_key] = self._modifier.modify_document(task.data.get(self.field_key, ""))
+            original = task.data.get(self.field_key, "")
+            # Keep the pre-cleanup text; the char-class rule above can be destructive.
+            task.data[self.raw_key] = original
+            task.data[self.field_key] = self._modifier.modify_document(original)
         return tasks
 
 
@@ -459,4 +531,5 @@ __all__ = [
     "AudioTaskRegexModifier",
     "REGEX_PARAMS_LIST",
     "RegexSubstitutionModifier",
+    "TokenizerRoundTripStage",
 ]
