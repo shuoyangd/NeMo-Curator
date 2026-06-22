@@ -28,6 +28,10 @@ Architecture
         .done are skipped; partial .jsonl files are deleted so the
         writer's append mode starts clean.
 
+    build_source_prefilter_stages (CPU, AudioTask → AudioTask)  [opt-in]
+        Source-only mark-only filters (word count; histogram/fastText).
+        Set _skipme so LLMTranslationStage skips vLLM on rejected rows.
+
     LLMTranslationStage           (GPU, AudioTask → AudioTask)
         Batched vLLM inference; writes data["translations"]
         as {display_name: translated_text}.
@@ -35,6 +39,12 @@ Architecture
     TranslationExpanderStage      (CPU, AudioTask → list[AudioTask])
         Fan-out: one task per direction with flat schema
         {text, source_lang, target_lang (ISO), translation}.
+
+    build_bitext_filter_stages    (CPU/GPU, AudioTask → AudioTask)  [opt-in]
+        Bitext mark-only filters on (source, translation): tgt word
+        count, length ratio, histogram/fastText, QE, regex cleanup.
+        Rows are annotated (_skipme + additional_notes) but never
+        dropped, so the writer's per-direction .done counting holds.
 
     DirectionalShardedWriterStage (CPU, AudioTask → AudioTask)
         Appends batched rows (grouped per (shard_key, direction)) to
@@ -69,7 +79,7 @@ Example
         --manifest /data/manifests \\
         --output_dir /data/translations \\
         --target_langs de fr ru ja \\
-        --model_id Qwen/Qwen3-8B
+        --nmt_model_id Qwen/Qwen3-8B
 """
 
 import os
@@ -91,7 +101,10 @@ from nemo_curator.stages.audio.translation import (
     LLMTranslationStage,
     TranslationExpanderStage,
     TranslationManifestReader,
+    add_bitext_filter_args,
     all_shards_done,
+    build_bitext_filter_stages,
+    build_source_prefilter_stages,
 )
 
 
@@ -137,9 +150,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Input manifest key holding the source language ISO code.",
     )
 
-    # ------------------------------------------------------------------ Model
+    # ------------------------------------------------------------ Translation (NMT) model
+    # All translation-stage knobs are prefixed --nmt_* to mark them as LLMTranslationStage config.
     ap.add_argument(
-        "--model_id",
+        "--nmt_model_id",
         type=str,
         required=True,
         help="Translation LLM model ID.",
@@ -147,12 +161,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     # Prompt overrides (mutually exclusive pairs)
     tpg = ap.add_mutually_exclusive_group()
-    tpg.add_argument("--translation_prompt", type=str, default=None)
-    tpg.add_argument("--translation_prompt_file", type=str, default=None)
+    tpg.add_argument("--nmt_translation_prompt", type=str, default=None)
+    tpg.add_argument("--nmt_translation_prompt_file", type=str, default=None)
 
     spg = ap.add_mutually_exclusive_group()
-    spg.add_argument("--system_prompt", type=str, default=None)
-    spg.add_argument("--system_prompt_file", type=str, default=None)
+    spg.add_argument("--nmt_system_prompt", type=str, default=None)
+    spg.add_argument("--nmt_system_prompt_file", type=str, default=None)
 
     ap.add_argument("--text_key", type=str, default="pnc_text", help="Manifest key for source text.")
     ap.add_argument(
@@ -166,27 +180,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
 
     # vLLM params
-    ap.add_argument("--tensor_parallel_size", type=int, default=None)
+    ap.add_argument("--nmt_tensor_parallel_size", type=int, default=None)
     ap.add_argument(
-        "--num_workers",
+        "--nmt_num_workers",
         type=int,
         default=None,
         help="Explicit number of GPU worker replicas for the translation stage under Xenna.",
     )
-    ap.add_argument("--batch_size", type=int, default=512)
-    ap.add_argument("--max_output_tokens", type=int, default=256)
-    ap.add_argument("--max_model_len", type=int, default=1024)
-    ap.add_argument("--max_num_seqs", type=int, default=512)
-    ap.add_argument("--max_num_batched_tokens", type=int, default=16384)
-    ap.add_argument("--gpu_memory_utilization", type=float, default=0.90)
-    ap.add_argument("--kv_cache_dtype", type=str, default="fp8")
-    ap.add_argument("--temperature", type=float, default=0.7)
-    ap.add_argument("--top_p", type=float, default=0.8)
-    ap.add_argument("--top_k", type=int, default=20)
-    ap.add_argument("--min_p", type=float, default=0.0)
-    ap.add_argument("--presence_penalty", type=float, default=1.5)
-    ap.add_argument("--repetition_penalty", type=float, default=1.0)
-    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--nmt_batch_size", type=int, default=512)
+    ap.add_argument("--nmt_max_output_tokens", type=int, default=256)
+    ap.add_argument("--nmt_max_model_len", type=int, default=1024)
+    ap.add_argument("--nmt_max_num_seqs", type=int, default=512)
+    ap.add_argument("--nmt_max_num_batched_tokens", type=int, default=16384)
+    ap.add_argument("--nmt_gpu_memory_utilization", type=float, default=0.90)
+    ap.add_argument("--nmt_kv_cache_dtype", type=str, default="fp8")
+    ap.add_argument("--nmt_temperature", type=float, default=0.7)
+    ap.add_argument("--nmt_top_p", type=float, default=0.8)
+    ap.add_argument("--nmt_top_k", type=int, default=20)
+    ap.add_argument("--nmt_min_p", type=float, default=0.0)
+    ap.add_argument("--nmt_presence_penalty", type=float, default=1.5)
+    ap.add_argument("--nmt_repetition_penalty", type=float, default=1.0)
+    ap.add_argument("--nmt_seed", type=int, default=1234)
 
     # ------------------------------------------------------------------ Executor
     ap.add_argument(
@@ -212,6 +226,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "workers join the cluster and block until teardown. Omit for single-node runs."
         ),
     )
+
+    add_bitext_filter_args(ap)
     return ap
 
 
@@ -225,34 +241,39 @@ def main() -> None:
             target_lang_codes=args.target_langs,
             source_lang_key=args.source_lang_code_key,
         ),
+        # Source-only filters: mark _skipme so the LLM skips vLLM on rejected rows.
+        *build_source_prefilter_stages(args),
         LLMTranslationStage(
-            model_id=args.model_id,
-            translation_prompt=args.translation_prompt,
-            translation_prompt_file=args.translation_prompt_file,
-            system_prompt=args.system_prompt,
-            system_prompt_file=args.system_prompt_file,
+            model_id=args.nmt_model_id,
+            translation_prompt=args.nmt_translation_prompt,
+            translation_prompt_file=args.nmt_translation_prompt_file,
+            system_prompt=args.nmt_system_prompt,
+            system_prompt_file=args.nmt_system_prompt_file,
             text_key=args.text_key,
             skip_me_key=args.skip_me_key,
-            tensor_parallel_size=args.tensor_parallel_size,
-            num_workers_override=args.num_workers,
-            max_output_tokens=args.max_output_tokens,
-            max_model_len=args.max_model_len,
-            max_num_seqs=args.max_num_seqs,
-            max_num_batched_tokens=args.max_num_batched_tokens,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            kv_cache_dtype=args.kv_cache_dtype,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            min_p=args.min_p,
-            presence_penalty=args.presence_penalty,
-            repetition_penalty=args.repetition_penalty,
-            seed=args.seed,
-            batch_size=args.batch_size,
+            tensor_parallel_size=args.nmt_tensor_parallel_size,
+            num_workers_override=args.nmt_num_workers,
+            max_output_tokens=args.nmt_max_output_tokens,
+            max_model_len=args.nmt_max_model_len,
+            max_num_seqs=args.nmt_max_num_seqs,
+            max_num_batched_tokens=args.nmt_max_num_batched_tokens,
+            gpu_memory_utilization=args.nmt_gpu_memory_utilization,
+            kv_cache_dtype=args.nmt_kv_cache_dtype,
+            temperature=args.nmt_temperature,
+            top_p=args.nmt_top_p,
+            top_k=args.nmt_top_k,
+            min_p=args.nmt_min_p,
+            presence_penalty=args.nmt_presence_penalty,
+            repetition_penalty=args.nmt_repetition_penalty,
+            seed=args.nmt_seed,
+            batch_size=args.nmt_batch_size,
         ),
         TranslationExpanderStage(
             source_lang_key=args.source_lang_code_key,
         ),
+        # Bitext filters on the (source, translation) pair; all mark-only so the
+        # writer's per-direction .done counting is preserved.
+        *build_bitext_filter_stages(args),
         DirectionalShardedWriterStage(
             output_dir=args.output_dir,
             source_lang_key="source_lang",

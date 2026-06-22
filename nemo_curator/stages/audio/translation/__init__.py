@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo_curator.stages.audio.translation.bitext_filters import (
+    AudioTaskBitextMarker,
+    AudioTaskFieldMarker,
+    AudioTaskMarkerChain,
+    AudioTaskQEMarker,
+    AudioTaskRegexModifier,
+)
 from nemo_curator.stages.audio.translation.directional_writer import DirectionalShardedWriterStage
 from nemo_curator.stages.audio.translation.llm_translation import LLMTranslationStage
 from nemo_curator.stages.audio.translation.manifest_reader import (
@@ -20,12 +27,25 @@ from nemo_curator.stages.audio.translation.manifest_reader import (
     all_shards_done,
 )
 from nemo_curator.stages.audio.translation.translation_expander import TranslationExpanderStage
+from nemo_curator.stages.audio.translation.translation_utils import (
+    add_bitext_filter_args,
+    build_bitext_filter_stages,
+    build_source_prefilter_stages,
+)
 
 __all__ = [
+    "AudioTaskBitextMarker",
+    "AudioTaskFieldMarker",
+    "AudioTaskMarkerChain",
+    "AudioTaskQEMarker",
+    "AudioTaskRegexModifier",
     "DirectionalShardedWriterStage",
     "LLMTranslationStage",
     "TranslationExpanderStage",
     "TranslationManifestReader",
     "TranslationManifestReaderStage",
+    "add_bitext_filter_args",
     "all_shards_done",
+    "build_bitext_filter_stages",
+    "build_source_prefilter_stages",
 ]
