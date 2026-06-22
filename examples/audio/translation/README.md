@@ -1,6 +1,6 @@
-# Bitext Cleaning
+# Translation with Bitext Filtering
 
-This tutorial shows a Ray-native bitext cleaning recipe modeled after the older Canary `en-x` data cleaning workflow. It uses `DocumentBatch` and `ProcessingStage` primitives directly and keeps aligned source-target rows intact while adding `_skipme` and `reason` rejection metadata.
+This example shows a Ray-native bitext cleaning recipe modeled after the older Canary `en-x` data cleaning workflow. It uses `DocumentBatch` and `ProcessingStage` primitives directly and keeps aligned source-target rows intact while adding `_skipme` and `reason` rejection metadata. With `--translate` it can first translate source-only rows (via the same translation stages as `run_translation_pipeline.py`) and then run them through the bitext filters.
 
 The default input is a small `Helsinki-NLP/news_commentary` sample. You can also pass JSONL files with either `src`/`tgt` columns or Canary manifest-style `text`/`answer` columns.
 
@@ -9,7 +9,7 @@ The default input is a small `Helsinki-NLP/news_commentary` sample. You can also
 Run a local CPU smoke test:
 
 ```bash
-python tutorials/text/bitext-cleaning/main.py \
+python examples/audio/translation/run_translation_pipeline_with_filtering.py \
   --input-jsonl /path/to/bitext.jsonl \
   --output-dir /tmp/curator-bitext-cleaning
 ```
@@ -17,7 +17,7 @@ python tutorials/text/bitext-cleaning/main.py \
 Run against a small News Commentary sample:
 
 ```bash
-python tutorials/text/bitext-cleaning/main.py \
+python examples/audio/translation/run_translation_pipeline_with_filtering.py \
   --dataset-config ar-cs \
   --max-rows 200 \
   --output-dir /tmp/curator-bitext-cleaning
@@ -26,7 +26,7 @@ python tutorials/text/bitext-cleaning/main.py \
 Run from a Canary YAML config:
 
 ```bash
-python tutorials/text/bitext-cleaning/main.py \
+python examples/audio/translation/run_translation_pipeline_with_filtering.py \
   --config /path/to/canary_config.yaml \
   --output-dir /tmp/curator-bitext-cleaning
 ```
@@ -38,7 +38,7 @@ The output JSONL contains all rows plus filter metadata. Rows rejected by a stag
 Add M2M histogram filtering:
 
 ```bash
-python tutorials/text/bitext-cleaning/main.py \
+python examples/audio/translation/run_translation_pipeline_with_filtering.py \
   --input-jsonl /path/to/bitext.jsonl \
   --enable-histogram \
   --output-dir /tmp/curator-bitext-cleaning
@@ -47,7 +47,7 @@ python tutorials/text/bitext-cleaning/main.py \
 Add FastText language ID filtering:
 
 ```bash
-python tutorials/text/bitext-cleaning/main.py \
+python examples/audio/translation/run_translation_pipeline_with_filtering.py \
   --input-jsonl /path/to/bitext.jsonl \
   --fasttext-model-path /path/to/lid.176.ftz \
   --output-dir /tmp/curator-bitext-cleaning
@@ -56,7 +56,7 @@ python tutorials/text/bitext-cleaning/main.py \
 Opt into QE filtering when COMET/PyMarian dependencies and model access are available:
 
 ```bash
-python tutorials/text/bitext-cleaning/main.py \
+python examples/audio/translation/run_translation_pipeline_with_filtering.py \
   --input-jsonl /path/to/bitext.jsonl \
   --run-qe \
   --qe-models comet-qe cometoid-wmt23 \
