@@ -240,6 +240,7 @@ def main() -> None:
             output_dir=args.output_dir,
             target_lang_codes=args.target_langs,
             source_lang_key=args.source_lang_code_key,
+            input_skip_key=args.skip_me_key,
         ),
         # Source-only filters: mark _skipme so the LLM skips vLLM on rejected rows.
         *build_source_prefilter_stages(args),
@@ -250,7 +251,9 @@ def main() -> None:
             system_prompt=args.nmt_system_prompt,
             system_prompt_file=args.nmt_system_prompt_file,
             text_key=args.text_key,
-            skip_me_key=args.skip_me_key,
+            # Honor the working flag (seeded from the input skip column by the reader),
+            # so input-flagged rows AND source-prefilter rejects skip vLLM.
+            skip_me_key="translation_skipme",
             tensor_parallel_size=args.nmt_tensor_parallel_size,
             num_workers_override=args.nmt_num_workers,
             max_output_tokens=args.nmt_max_output_tokens,

@@ -69,6 +69,7 @@ class TranslationExpanderStage(ProcessingStage[AudioTask, AudioTask]):
     translations_key: str = TRANSLATIONS_KEY
     target_lang_key: str = "target_lang"
     translation_key: str = "translation"
+    translation_raw_key: str = "translation_raw"
 
     _n_expanded: int = field(default=0, init=False, repr=False)
 
@@ -76,7 +77,7 @@ class TranslationExpanderStage(ProcessingStage[AudioTask, AudioTask]):
         return [], [self.translations_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.target_lang_key, self.translation_key]
+        return [], [self.target_lang_key, self.translation_key, self.translation_raw_key]
 
     def process(self, task: AudioTask) -> list[AudioTask]:  # type: ignore[override]
         translations: dict[str, str] = task.data.get(self.translations_key) or {}
@@ -101,6 +102,9 @@ class TranslationExpanderStage(ProcessingStage[AudioTask, AudioTask]):
             output_data = dict(source_data)
             output_data[self.target_lang_key] = tgt_code
             output_data[self.translation_key] = (translated_text or "").strip()
+            # Preserve the translation as produced here, so it survives any later
+            # in-place mutation of `translation` (e.g. regex cleanup).
+            output_data[self.translation_raw_key] = output_data[self.translation_key]
 
             results.append(
                 AudioTask(

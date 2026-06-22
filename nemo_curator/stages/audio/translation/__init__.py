@@ -18,6 +18,7 @@ from nemo_curator.stages.audio.translation.bitext_filters import (
     AudioTaskMarkerChain,
     AudioTaskQEMarker,
     AudioTaskRegexModifier,
+    FinalizeTranslationStage,
     TokenizerRoundTripStage,
 )
 from nemo_curator.stages.audio.translation.directional_writer import DirectionalShardedWriterStage
@@ -41,6 +42,7 @@ __all__ = [
     "AudioTaskQEMarker",
     "AudioTaskRegexModifier",
     "DirectionalShardedWriterStage",
+    "FinalizeTranslationStage",
     "LLMTranslationStage",
     "TranslationExpanderStage",
     "TokenizerRoundTripStage",

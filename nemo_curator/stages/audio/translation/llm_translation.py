@@ -362,15 +362,18 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # Processing
     # ------------------------------------------------------------------
 
-    def _emit_empty_translations(self, task: AudioTask, targets: list[str], reason: str) -> None:
+    def _emit_empty_translations(self, task: AudioTask, targets: list[str], note: str | None = None) -> None:
         # Do not run the LLM, but keep the row with one empty translation per
         # target so the writer's per-direction counter still reaches .done.
         # ``setdefault`` preserves any translations already produced for the row.
+        # ``note`` is None for the flagged-skip path (the skip flag is the reason,
+        # so no note is recorded), and an ``applied (...)`` note otherwise.
         translations = task.data.get(self.translations_key) or {}
         for target_lang in targets:
             translations.setdefault(target_lang, "")
         task.data[self.translations_key] = translations
-        set_note(task.data, self.name, reason, self.notes_key)
+        if note is not None:
+            set_note(task.data, self.name, note, self.notes_key)
 
     def process(self, task: AudioTask) -> AudioTask:
         return self.process_batch([task])[0]
@@ -406,16 +409,17 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             if not targets:
                 continue
 
-            # Honor the _skipme flag (non-empty string or boolean True): keep the
-            # row but emit empty translations instead of running the LLM.
+            # Honor the skip flag (non-empty string or boolean True): keep the row
+            # but emit empty translations instead of running the LLM. The skip flag
+            # is the reason, so no note is recorded here.
             if data.get(self.skip_me_key, ""):
-                self._emit_empty_translations(task, targets, "skipped (flagged)")
+                self._emit_empty_translations(task, targets)
                 continue
 
             text = data.get(self.text_key, "")
             if not text or not text.strip():
                 # Empty source text: nothing to translate, emit empty translations.
-                self._emit_empty_translations(task, targets, "skipped (empty text)")
+                self._emit_empty_translations(task, targets, "applied (empty_text_skipped)")
                 continue
 
             for target_lang in targets:
@@ -442,6 +446,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 translations = task.data.get(self.translations_key) or {}
                 translations[target_lang] = translation
                 task.data[self.translations_key] = translations
+                set_note(task.data, self.name, "applied (translated)", self.notes_key)
                 self._n_processed += 1
 
         logger.debug("LLMTranslation: batch of {} tasks ({} translations)", len(tasks), len(prompts))

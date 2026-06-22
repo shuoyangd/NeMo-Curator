@@ -58,6 +58,7 @@ from nemo_curator.stages.audio.translation.translation_utils import (
     SOURCE_LANG_CODE_KEY,
     SOURCE_LANG_NAME_KEY,
     TRANSLATE_TO_KEY,
+    TRANSLATION_SKIP_KEY,
     output_paths,
     parse_handle_key,
 )
@@ -231,6 +232,7 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     source_lang_key: str = "source_lang"
     source_lang_name_key: str = SOURCE_LANG_NAME_KEY
     translate_to_key: str = TRANSLATE_TO_KEY
+    input_skip_key: str = "_skipme"
     input_root: str | None = None
 
     _target_codes_norm: list[str] = field(default_factory=list, init=False, repr=False)
@@ -311,6 +313,9 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 # Canonicalize the source-lang code into a fixed key so downstream
                 # stages (filters, writer) don't depend on the input column name.
                 row[SOURCE_LANG_CODE_KEY] = src_raw
+                # Seed the working skip flag from the original input flag (left
+                # untouched). All filters and the LLM gate on translation_skipme.
+                row[TRANSLATION_SKIP_KEY] = int(bool(row.get(self.input_skip_key, 0)))
                 row[self.translate_to_key] = target_names
 
                 for tgt_norm in self._row_targets(src_norm):
@@ -431,6 +436,7 @@ class TranslationManifestReader(CompositeStage[_EmptyTask, AudioTask]):
     source_lang_key: str = "source_lang"
     source_lang_name_key: str = SOURCE_LANG_NAME_KEY
     translate_to_key: str = TRANSLATE_TO_KEY
+    input_skip_key: str = "_skipme"
     files_per_partition: int | None = 1
     file_extensions: list[str] | None = None
     storage_options: dict[str, Any] | None = None
@@ -461,6 +467,7 @@ class TranslationManifestReader(CompositeStage[_EmptyTask, AudioTask]):
                 source_lang_key=self.source_lang_key,
                 source_lang_name_key=self.source_lang_name_key,
                 translate_to_key=self.translate_to_key,
+                input_skip_key=self.input_skip_key,
                 input_root=_derive_input_root(self.manifest_path),
             ),
         ]

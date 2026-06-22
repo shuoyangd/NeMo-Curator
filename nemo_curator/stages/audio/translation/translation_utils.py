@@ -51,6 +51,11 @@ DONE_EXT = ".jsonl.done"
 # regardless of the input column name.
 SOURCE_LANG_CODE_KEY = "source_lang"
 
+# Working skip flag for the filtering pipeline. The reader seeds it from the input
+# ``_skipme`` column; all filter markers and the LLM gate on THIS field, leaving the
+# original ``_skipme`` untouched.
+TRANSLATION_SKIP_KEY = "translation_skipme"
+
 # Internal scratch keys (never appear in the output manifest).
 SOURCE_LANG_NAME_KEY = "source_lang_name"
 TRANSLATE_TO_KEY = "translate_to"
@@ -133,23 +138,29 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
     shared = parser.add_argument_group("bitext filtering: resources")
     shared.add_argument("--cpu_stage_cpus", type=float, default=1.0, help="CPUs per CPU filter stage.")
 
-    wc = parser.add_argument_group("bitext filtering: word count (wc)")
-    wc.add_argument(
-        "--wc_src", action="store_true",
-        help="Enable the word-count filter on the source text, pre-translation (marks short sources skip).",
+    cc = parser.add_argument_group("bitext filtering: character count (cc)")
+    cc.add_argument(
+        "--cc_src", action="store_true",
+        help="Enable the character-count filter on the source text, pre-translation (marks short sources skip).",
     )
-    wc.add_argument(
-        "--wc_tgt", action="store_true",
-        help="Enable the word-count filter on the translation, post-translation.",
+    cc.add_argument(
+        "--cc_tgt", action="store_true",
+        help="Enable the character-count filter on the translation, post-translation.",
     )
-    wc.add_argument("--wc_min_words", type=int, default=4, help="Minimum words to keep (src and tgt).")
+    cc.add_argument(
+        "--cc_min_chars", type=int, default=1,
+        help="Minimum Unicode characters to keep (src and tgt). CJK-safe (no word splitter).",
+    )
 
     lr = parser.add_argument_group("bitext filtering: length ratio")
     lr.add_argument(
         "--length_ratio", action="store_true",
-        help="Enable the length-ratio filter on the (source, translation) pair.",
+        help="Enable the character-count length-ratio filter on the (source, translation) pair.",
     )
-    lr.add_argument("--length_ratio_max", type=float, default=9.0, help="Max src/tgt length ratio.")
+    lr.add_argument(
+        "--length_ratio_max", type=float, default=9.0,
+        help="Max src/tgt character-count ratio (CJK-safe; no word splitter).",
+    )
 
     hist = parser.add_argument_group("bitext filtering: histogram")
     hist.add_argument(
@@ -217,20 +228,6 @@ def _candidate_langs(args: argparse.Namespace) -> list[str]:
     return sorted(lang for lang in ({"en"} | {_normalize_code(c) for c in args.target_langs}) if lang)
 
 
-def _lang_pairs(args: argparse.Namespace) -> list[tuple[str, str]]:
-    """English-centric (src, tgt) pairs the reader actually emits: ``en->X`` and ``X->en``.
-
-    The reader is English-centric, so non-English pairs (``X->Y``) never occur;
-    building filters for them would be wasted work (and would pull in CJK
-    tokenizers for unused directions).
-    """
-    pairs: list[tuple[str, str]] = []
-    for x in sorted({_normalize_code(c) for c in args.target_langs} - {"en", ""}):
-        pairs.append(("en", x))
-        pairs.append((x, "en"))
-    return pairs
-
-
 def _require_fasttext_model(args: argparse.Namespace, flag_name: str, enabled: bool) -> None:
     """A langid stage needs a model path; fail loudly if it was enabled without one."""
     if enabled and not args.langid_model_path:
@@ -246,23 +243,24 @@ def build_source_prefilter_stages(args: argparse.Namespace) -> list[ProcessingSt
     dispatched per row by the row's ``source_lang`` (so the right word splitter /
     histogram / expected language is used for each direction).
     """
-    from nemo_curator.stages.audio.translation.bitext_filters import AudioTaskFieldMarker, AudioTaskMarkerChain
-    
+    from nemo_curator.stages.audio.translation.bitext_filters import (
+        AudioTaskFieldMarker,
+        AudioTaskMarkerChain,
+        CharCountFilter,
+    )
 
     _require_fasttext_model(args, "--langid_src", args.langid_src)
     cand = _candidate_langs(args)
     markers: list[Any] = []
 
-    if args.wc_src:
-        from nemo_curator.stages.text.filters.heuristic import WordCountFilter
-        
+    if args.cc_src:
+        # Character count (CJK-safe): language-agnostic, single filter (no per-lang dispatch).
         markers.append(
             AudioTaskFieldMarker(
-                filters_by_lang={lang: WordCountFilter(min_words=args.wc_min_words, lang=lang) for lang in cand},
-                lang_key=_SOURCE_LANG_FIELD,
+                filter_obj=CharCountFilter(min_chars=args.cc_min_chars),
                 text_key=args.text_key,
-                score_key="src_word_count_score",
-                name="src_word_count",
+                score_key="src_char_count_score",
+                name="src_char_count",
             )
         )
 
@@ -324,40 +322,36 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
         AudioTaskMarkerChain,
         AudioTaskQEMarker,
         AudioTaskRegexModifier,
+        CharCountFilter,
+        CharLengthRatioFilter,
+        FinalizeTranslationStage,
         TokenizerRoundTripStage,
     )
-    from nemo_curator.stages.text.filters.bitext import LengthRatioFilter
-    from nemo_curator.stages.text.filters.heuristic import WordCountFilter
 
     _require_fasttext_model(args, "--langid_tgt", args.langid_tgt)
     cpu = Resources(cpus=args.cpu_stage_cpus)
     cand = _candidate_langs(args)
-    pairs = _lang_pairs(args)
 
     # Per-row mark-only markers, fused into one chain stage (one hand-off per row).
     markers: list[Any] = []
 
-    if args.wc_tgt:
+    if args.cc_tgt:
+        # Character count (CJK-safe): language-agnostic, single filter (no per-lang dispatch).
         markers.append(
             AudioTaskFieldMarker(
-                filters_by_lang={lang: WordCountFilter(min_words=args.wc_min_words, lang=lang) for lang in cand},
-                lang_key=_TARGET_LANG_FIELD,
+                filter_obj=CharCountFilter(min_chars=args.cc_min_chars),
                 text_key=_TRANSLATION_FIELD,
-                score_key="tgt_word_count_score",
-                name="tgt_word_count",
+                score_key="tgt_char_count_score",
+                name="tgt_char_count",
             )
         )
 
-    # Length ratio is a bitext (both-sides) filter, not separable into src/tgt.
+    # Length ratio is a bitext (both-sides) filter. Character-count ratio is
+    # language-agnostic, so a single filter handles every direction.
     if args.length_ratio:
         markers.append(
             AudioTaskBitextMarker(
-                filters_by_pair={
-                    (src, tgt): LengthRatioFilter(max_ratio=args.length_ratio_max, src_lang=src, tgt_lang=tgt)
-                    for src, tgt in pairs
-                },
-                src_lang_key=_SOURCE_LANG_FIELD,
-                tgt_lang_key=_TARGET_LANG_FIELD,
+                filter_obj=CharLengthRatioFilter(max_ratio=args.length_ratio_max),
                 src_key=args.text_key,
                 tgt_key=_TRANSLATION_FIELD,
                 score_key="length_ratio_score",
@@ -409,7 +403,7 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
 
     # QE is a separate batched (GPU) stage; regex cleanup runs on every row (incl. skipped).
     if args.qe:
-        for model_name in args.qe_models:
+        for idx, model_name in enumerate(args.qe_models):
             model_kwargs: dict[str, Any] = {}
             if model_name.startswith("cometoid"):
                 model_kwargs["shard_size"] = args.qe_pymarian_shard_size
@@ -428,6 +422,9 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                     src_lang_key=_SOURCE_LANG_FIELD,
                     tgt_lang_key=_TARGET_LANG_FIELD,
                     score_key=QE_SCORE_FIELDS[model_name],
+                    # Only the first QE model surfaces translation_quality_score; the
+                    # rest only note their score / gate skip (no temp column either).
+                    surface_quality=(idx == 0),
                     name=f"qe:{model_name}",
                     model_kwargs=model_kwargs,
                 ).with_(resources=qe_resources, batch_size=args.qe_batch_size)
@@ -443,5 +440,10 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
 
     if args.regex_cleanup:
         stages.append(AudioTaskRegexModifier(field_key=_TRANSLATION_FIELD).with_(resources=cpu))
+
+    # Finalize (always): normalize the translation fields for the filtered /
+    # empty-source / kept cases. Each upstream stage already cleaned up its own
+    # temporary fields, so finalize only sets translation/raw/quality.
+    stages.append(FinalizeTranslationStage(source_text_key=args.text_key).with_(resources=cpu))
 
     return stages

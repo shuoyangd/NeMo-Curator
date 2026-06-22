@@ -30,6 +30,7 @@ and the QE ``QEModel`` wrappers, applied per row, so there is no
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -47,7 +48,8 @@ if TYPE_CHECKING:
     from nemo_curator.stages.text.filters.bitext import BitextFilter
     from nemo_curator.stages.text.filters.doc_filter import DocumentFilter
 
-SKIP_KEY = "_skipme"
+SKIP_KEY = "_skipme"  # original input flag — never written by filters
+WORK_SKIP_KEY = "translation_skipme"  # working flag the filters/LLM gate on (seeded from _skipme)
 NOTES_KEY = "additional_notes"
 
 # Fixed regex cleanup applied to the translated field (ported verbatim from the
@@ -77,8 +79,8 @@ REGEX_PARAMS_LIST: list[dict[str, str]] = [
     # ONLY Latin/Cyrillic/Greek letters + digits/punctuation/currency and DELETES
     # everything else. For a target in CJK/Arabic/Hebrew/Hangul/Devanagari/Thai it
     # strips the whole translation -> "". Only safe for Latin/Cyrillic/Greek targets;
-    # disable regex cleanup (drop --regex_cleanup) for others. See translation_raw
-    # (AudioTaskRegexModifier) for the preserved pre-cleanup text.
+    # disable regex cleanup (drop --regex_cleanup) for others. The untouched original
+    # is always kept in `translation_raw` (written by TranslationExpanderStage).
     {
         "pattern": "[^ !$%',-.0123456789;?ABCDEFGHIJKLMNOPQRSßTUVWXYŸZabcdefghijklmnopqrsẞtuvwxyÿz¡£¿ÀÁÂÃÄÅÆÇÈÉÊÌÍÎÑÒÓÔÕÖØÙÚÜÝàáâãäåæçèéêëìíîïñòóôõöøùúûüýĀāĂăĄąĆćĊċČčĎďĐđĒēĖėĘęĚěĠġĢģĦħĪīĮįĶķĹĺĻļĽľŁłŃńŅņŇňŐőŒœŔŕŘřŚśŠšŤťŪūŮůŰűŲųŹźŻżŽžȘșȚțΆΈΉΌΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩάέήίαβγδεζηθικλμνξοπρστυφχψωϊόύώЁЄІЇАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяёєіїҐґ€₴₽/:]",
         "repl": "",
@@ -102,10 +104,66 @@ def _is_skipped(task: AudioTask, skip_key: str = SKIP_KEY) -> bool:
     return bool(task.data.get(skip_key, 0))
 
 
-def _mark_skip(task: AudioTask, stage_name: str, detail: str, notes_key: str = NOTES_KEY, skip_key: str = SKIP_KEY) -> None:
-    """Set the ``_skipme`` gate and record the per-stage reason in ``additional_notes``."""
+def _set_skip(task: AudioTask, skip_key: str = WORK_SKIP_KEY) -> None:
+    """Set the working skip gate. The reason is recorded separately by ``_add_note``."""
     task.data[skip_key] = 1
+
+
+def _add_note(task: AudioTask, stage_name: str, detail: str, notes_key: str = NOTES_KEY) -> None:
+    """Record a per-stage ``applied (...)`` note in ``additional_notes``.
+
+    Written on every application (pass *or* fail) so ``additional_notes`` lists the
+    important stages that actually ran on the row, with their score. The skip
+    decision itself is carried only by ``translation_skipme`` (no skip text here).
+    """
     set_note(task.data, stage_name, detail, notes_key)
+
+
+class CharCountFilter:
+    """Length filter counting Unicode characters (CJK-safe; no word splitter).
+
+    A drop-in replacement for ``WordCountFilter`` that counts characters instead of
+    words, so it works for space-less scripts (zh/ja/...) without jieba/MeCab. Counts
+    every character of the outer-stripped text (internal spaces included). Plain
+    scoring object (no ``DocumentFilter`` base) — the marker stages duck-type
+    ``score_document`` / ``keep_document``.
+    """
+
+    def __init__(self, min_chars: int = 1, max_chars: int = 100000) -> None:
+        self._min_chars = min_chars
+        self._max_chars = max_chars
+        self._name = "char_count"
+
+    def score_document(self, text: str) -> float:
+        return len(text.strip())
+
+    def keep_document(self, score: float) -> bool:
+        return self._min_chars <= score <= self._max_chars
+
+
+class CharLengthRatioFilter:
+    """Source/target character-count ratio (CJK-safe; language-agnostic).
+
+    A drop-in replacement for ``LengthRatioFilter`` that uses character counts
+    instead of word counts, so no per-language word splitter is needed. Mirrors
+    ``LengthRatioFilter.score_bitext``: ``math.inf`` when either side is empty, else
+    ``max(src/tgt, tgt/src)``. Plain scoring object — markers duck-type
+    ``score_bitext`` / ``keep_bitext``.
+    """
+
+    def __init__(self, max_ratio: float = 9.0) -> None:
+        self._max_ratio = float(max_ratio)
+        self._name = "char_length_ratio"
+
+    def score_bitext(self, src: str, tgt: str) -> float:
+        src_len = len(src.strip())
+        tgt_len = len(tgt.strip())
+        if src_len == 0 or tgt_len == 0:
+            return math.inf
+        return max(src_len / tgt_len, tgt_len / src_len)
+
+    def keep_bitext(self, score: float) -> bool:
+        return score < self._max_ratio
 
 
 class RegexSubstitutionModifier:
@@ -135,9 +193,11 @@ class AudioTaskFieldMarker(ProcessingStage[AudioTask, AudioTask]):
         varies per row. Rows whose language has no entry are left unscored.
 
     Reuses the filter's ``score_document`` / ``keep_document``. Rows already
-    marked (``_skipme`` set) are not re-scored. The numeric score is written to
-    ``score_key`` for every evaluated row; rejected rows additionally get
-    ``_skipme=1`` and an ``additional_notes[name]`` reason.
+    marked are not re-scored. The score is recorded only in ``additional_notes``
+    (``applied (score_key=value)``) — no temporary score column is left on the
+    row, so each stage cleans up after itself and the output keeps just the input
+    fields plus the translation fields. Rejected rows additionally get the working
+    skip gate set.
     """
 
     filter_obj: DocumentFilter | None = None
@@ -146,7 +206,7 @@ class AudioTaskFieldMarker(ProcessingStage[AudioTask, AudioTask]):
     text_key: str = ""
     score_key: str = ""
     name: str = "field_marker"
-    skip_key: str = SKIP_KEY
+    skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
 
     def _all_filters(self) -> list[DocumentFilter]:
@@ -164,7 +224,7 @@ class AudioTaskFieldMarker(ProcessingStage[AudioTask, AudioTask]):
         return [], [self.text_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.score_key]
+        return [], [self.notes_key]
 
     def requires_setup(self) -> bool:
         return any(hasattr(f, "load_model") or hasattr(f, "load_tokenizer") for f in self._all_filters())
@@ -198,9 +258,9 @@ class AudioTaskFieldMarker(ProcessingStage[AudioTask, AudioTask]):
             return False
         text = str(task.data.get(self.text_key, "") or "")
         score = filter_obj.score_document(text)
-        task.data[self.score_key] = score
+        _add_note(task, self.name, f"applied ({self.score_key}={score})", self.notes_key)
         if not filter_obj.keep_document(score):
-            _mark_skip(task, self.name, f"{self.score_key}={score}", self.notes_key, self.skip_key)
+            _set_skip(task, self.skip_key)
             return True
         task.data.setdefault(self.skip_key, 0)
         return False
@@ -239,7 +299,7 @@ class AudioTaskBitextMarker(ProcessingStage[AudioTask, AudioTask]):
     tgt_key: str = ""
     score_key: str = ""
     name: str = "bitext_marker"
-    skip_key: str = SKIP_KEY
+    skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
 
     def _pick_filter(self, task: AudioTask) -> BitextFilter | None:
@@ -253,7 +313,7 @@ class AudioTaskBitextMarker(ProcessingStage[AudioTask, AudioTask]):
         return [], [self.src_key, self.tgt_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.score_key]
+        return [], [self.notes_key]
 
     def requires_setup(self) -> bool:
         return False  # BitextFilter (length ratio) loads no model
@@ -274,9 +334,9 @@ class AudioTaskBitextMarker(ProcessingStage[AudioTask, AudioTask]):
         src = str(task.data.get(self.src_key, "") or "")
         tgt = str(task.data.get(self.tgt_key, "") or "")
         score = filter_obj.score_bitext(src, tgt)
-        task.data[self.score_key] = score
+        _add_note(task, self.name, f"applied ({self.score_key}={score})", self.notes_key)
         if not filter_obj.keep_bitext(score):
-            _mark_skip(task, self.name, f"{self.score_key}={score}", self.notes_key, self.skip_key)
+            _set_skip(task, self.skip_key)
             return True
         task.data.setdefault(self.skip_key, 0)
         return False
@@ -297,16 +357,17 @@ class AudioTaskMarkerChain(ProcessingStage[AudioTask, AudioTask]):
     Fuses what would otherwise be separate per-row CPU marker stages into one
     stage, so a row is handed between pipeline operators once instead of N times.
     Each member marker (``AudioTaskFieldMarker`` / ``AudioTaskBitextMarker``)
-    still writes its own ``score_key`` and ``additional_notes`` reason; the chain
-    applies them in order and short-circuits as soon as one marks the row
-    ``_skipme`` (preserving the standalone "first reason wins" behavior). Members
+    still records its own ``additional_notes`` score note; the chain applies them
+    in order and short-circuits as soon as one sets the working skip gate
+    (preserving the standalone "first reject wins" behavior). Members
     are held as scoring objects only — their resources/specs are ignored; the
     chain's own ``.with_(...)``/``ray_stage_spec`` govern scheduling.
     """
 
     markers: list[Any] = field(default_factory=list)
     name: str = "marker_chain"
-    skip_key: str = SKIP_KEY
+    skip_key: str = WORK_SKIP_KEY
+    notes_key: str = NOTES_KEY
 
     def inputs(self) -> tuple[list[str], list[str]]:
         keys: list[str] = []
@@ -315,7 +376,7 @@ class AudioTaskMarkerChain(ProcessingStage[AudioTask, AudioTask]):
         return [], sorted(set(keys))
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], sorted({marker.score_key for marker in self.markers})
+        return [], [self.notes_key]
 
     def ray_stage_spec(self) -> dict[str, Any]:
         return {RayStageSpecKeys.IS_ACTOR_STAGE: any(m.requires_setup() for m in self.markers)}
@@ -348,8 +409,14 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
     ``setup()`` loads the QE model once per worker (``COMET`` or ``PyMarian``
     Cometoid). ``process_batch`` gathers every not-yet-skipped row, builds QE
     inputs (per-row direction handling for ``always_en_x`` / ``bidi``), runs a
-    single ``model.predict(...)``, writes ``score_key``, and marks rows scoring
-    below ``cutoff``. This is the only filter that needs a real batch.
+    single ``model.predict(...)``, records the score in ``additional_notes``, and
+    marks rows scoring below ``cutoff``. This is the only filter that needs a real
+    batch.
+
+    When ``surface_quality`` is set, the score is also written to ``quality_key``
+    (``translation_quality_score``) so it becomes the row's final quality score —
+    no temporary per-model score column is left behind. With several QE models
+    only the first surfaces its score (the rest add notes / gate skip only).
     """
 
     model_name: str
@@ -361,8 +428,10 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
     src_lang_key: str = "source_lang"
     tgt_lang_key: str = "target_lang"
     score_key: str = "qe_score"
+    quality_key: str = "translation_quality_score"
+    surface_quality: bool = True
     name: str = "qe_filter"
-    skip_key: str = SKIP_KEY
+    skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
     model_kwargs: dict[str, Any] = field(default_factory=dict)
     model: Any = None
@@ -371,7 +440,7 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
         return [], [self.src_key, self.tgt_key, self.src_lang_key, self.tgt_lang_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.score_key]
+        return [], [self.quality_key, self.notes_key] if self.surface_quality else [self.notes_key]
 
     def ray_stage_spec(self) -> dict[str, Any]:
         return {RayStageSpecKeys.IS_ACTOR_STAGE: True}
@@ -399,9 +468,11 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
         scores = self._score(pending)
         for task, score in zip(pending, scores, strict=True):
             value = float(score)
-            task.data[self.score_key] = value
+            _add_note(task, self.name, f"applied ({self.score_key}={value:.4f})", self.notes_key)
+            if self.surface_quality:
+                task.data[self.quality_key] = value
             if value < self.cutoff:
-                _mark_skip(task, self.name, f"{self.score_key}={value:.4f}<{self.cutoff}", self.notes_key, self.skip_key)
+                _set_skip(task, self.skip_key)
             else:
                 task.data.setdefault(self.skip_key, 0)
         return tasks
@@ -446,7 +517,7 @@ class TokenizerRoundTripStage(ProcessingStage[AudioTask, AudioTask]):
     model_id: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
     text_key: str = "translation"
     name: str = "tokenizer_roundtrip"
-    skip_key: str = SKIP_KEY
+    skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
     trust_remote_code: bool = True
     tokenizer: Any = None
@@ -455,7 +526,7 @@ class TokenizerRoundTripStage(ProcessingStage[AudioTask, AudioTask]):
         return [], [self.text_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], []
+        return [], [self.notes_key]
 
     def ray_stage_spec(self) -> dict[str, Any]:
         return {RayStageSpecKeys.IS_ACTOR_STAGE: True}
@@ -481,8 +552,10 @@ class TokenizerRoundTripStage(ProcessingStage[AudioTask, AudioTask]):
                 continue
             ids = self.tokenizer.encode(text, add_special_tokens=False)
             decoded = self.tokenizer.decode(ids, skip_special_tokens=True)
-            if decoded.strip() != text.strip():
-                _mark_skip(task, self.name, "tokenizer round-trip mismatch", self.notes_key, self.skip_key)
+            bad = decoded.strip() != text.strip()
+            _add_note(task, self.name, f"applied (tokenizer_roundtrip={'mismatch' if bad else 'ok'})", self.notes_key)
+            if bad:
+                _set_skip(task, self.skip_key)
         return tasks
 
 
@@ -490,36 +563,93 @@ class TokenizerRoundTripStage(ProcessingStage[AudioTask, AudioTask]):
 class AudioTaskRegexModifier(ProcessingStage[AudioTask, AudioTask]):
     """Apply the fixed ``REGEX_PARAMS_LIST`` cleanup to one text field per row.
 
-    The cleanup overwrites ``field_key`` in place, but the original (pre-cleanup)
-    value is first preserved under ``raw_key`` (default ``"{field_key}_raw"``) so the
-    untouched text survives even when the destructive char-class rule empties or
-    mangles it.
+    Overwrites ``field_key`` in place. The untouched original is preserved upstream
+    by ``TranslationExpanderStage`` under ``translation_raw`` (always written), so
+    the verbatim text survives even when the destructive char-class rule empties or
+    mangles ``translation``. Already-skipped rows are left untouched. Each evaluated
+    row gets an ``additional_notes`` note (``applied (modified|unchanged)``).
     """
 
     field_key: str = "translation"
-    raw_key: str = ""  # defaults to f"{field_key}_raw"
     regex_params: list[dict[str, str]] = field(default_factory=lambda: REGEX_PARAMS_LIST)
     name: str = "regex_cleanup"
+    skip_key: str = WORK_SKIP_KEY
+    notes_key: str = NOTES_KEY
 
     def __post_init__(self) -> None:
-        self.raw_key = self.raw_key or f"{self.field_key}_raw"
         self._modifier = RegexSubstitutionModifier(self.regex_params)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], [self.field_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.field_key, self.raw_key]
+        return [], [self.field_key, self.notes_key]
 
     def process(self, task: AudioTask) -> AudioTask:
         return self.process_batch([task])[0]
 
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
         for task in tasks:
-            original = task.data.get(self.field_key, "")
-            # Keep the pre-cleanup text; the char-class rule above can be destructive.
-            task.data[self.raw_key] = original
-            task.data[self.field_key] = self._modifier.modify_document(original)
+            if _is_skipped(task, self.skip_key):
+                continue
+            original = str(task.data.get(self.field_key, "") or "")
+            cleaned = self._modifier.modify_document(original)
+            task.data[self.field_key] = cleaned
+            _add_note(task, self.name, f"applied ({'modified' if cleaned != original else 'unchanged'})", self.notes_key)
+        return tasks
+
+
+@dataclass
+class FinalizeTranslationStage(ProcessingStage[AudioTask, AudioTask]):
+    """Finalize each row's translation fields for output.
+
+    Each upstream stage already cleans up after itself (markers record their score
+    in ``additional_notes`` and leave no temporary column; QE writes the surfaced
+    ``translation_quality_score`` directly; the expander strips its scratch keys),
+    so the output is just the input fields + the translation fields and this stage
+    only normalizes the three cases:
+
+    - filtered (``skip_key`` set): empty ``translation`` + ``translation_raw``,
+      ``translation_quality_score = None``;
+    - empty/space source: empty ``translation`` + ``translation_raw``,
+      ``translation_quality_score = 1`` (distinct from a filtered row);
+    - kept: ``translation_quality_score`` = the QE score already written by the QE
+      stage (``None`` when QE is off / didn't run).
+    """
+
+    translation_key: str = "translation"
+    translation_raw_key: str = "translation_raw"
+    quality_key: str = "translation_quality_score"
+    skip_key: str = WORK_SKIP_KEY
+    source_text_key: str = "pnc_text"
+    name: str = "finalize_translation"
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        return [], []
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return [], [self.translation_key, self.translation_raw_key, self.quality_key]
+
+    def process(self, task: AudioTask) -> AudioTask:
+        return self.process_batch([task])[0]
+
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+        for task in tasks:
+            data = task.data
+            if data.get(self.skip_key):
+                # Filtered out by a quality stage: empty translation + raw, quality None.
+                data[self.translation_key] = ""
+                data[self.translation_raw_key] = ""
+                data[self.quality_key] = None
+            elif not str(data.get(self.source_text_key, "") or "").strip():
+                # Empty/space source — nothing to translate. A distinct case from a
+                # filtered row (NOT translation_skipme); sentinel quality 1.
+                data[self.translation_key] = ""
+                data[self.translation_raw_key] = ""
+                data[self.quality_key] = 1
+            else:
+                # Kept: keep the QE score the QE stage surfaced, else None.
+                data.setdefault(self.quality_key, None)
         return tasks
 
 
@@ -529,6 +659,9 @@ __all__ = [
     "AudioTaskMarkerChain",
     "AudioTaskQEMarker",
     "AudioTaskRegexModifier",
+    "CharCountFilter",
+    "CharLengthRatioFilter",
+    "FinalizeTranslationStage",
     "REGEX_PARAMS_LIST",
     "RegexSubstitutionModifier",
     "TokenizerRoundTripStage",
