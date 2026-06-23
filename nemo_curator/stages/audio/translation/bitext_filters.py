@@ -77,16 +77,16 @@ REGEX_PARAMS_LIST: list[dict[str, str]] = [
     {"pattern": r"\[[^\]]*\]", "repl": ""},
     {"pattern": r" ?\([^\)]+\)", "repl": ""},
     {"pattern": r" ?{[^}]+}", "repl": ""},
-    # WARNING — destructive and NOT script-aware: this negated character class keeps
+    # DISABLED — destructive and NOT script-aware: this negated character class keeps
     # ONLY Latin/Cyrillic/Greek letters + digits/punctuation/currency and DELETES
-    # everything else. For a target in CJK/Arabic/Hebrew/Hangul/Devanagari/Thai it
-    # strips the whole translation -> "". Only safe for Latin/Cyrillic/Greek targets;
-    # disable regex cleanup (drop --regex_cleanup) for others. The untouched original
-    # is always kept in `translation_raw` (written by TranslationExpanderStage).
-    {
-        "pattern": "[^ !$%',-.0123456789;?ABCDEFGHIJKLMNOPQRSßTUVWXYŸZabcdefghijklmnopqrsẞtuvwxyÿz¡£¿ÀÁÂÃÄÅÆÇÈÉÊÌÍÎÑÒÓÔÕÖØÙÚÜÝàáâãäåæçèéêëìíîïñòóôõöøùúûüýĀāĂăĄąĆćĊċČčĎďĐđĒēĖėĘęĚěĠġĢģĦħĪīĮįĶķĹĺĻļĽľŁłŃńŅņŇňŐőŒœŔŕŘřŚśŠšŤťŪūŮůŰűŲųŹźŻżŽžȘșȚțΆΈΉΌΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩάέήίαβγδεζηθικλμνξοπρστυφχψωϊόύώЁЄІЇАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяёєіїҐґ€₴₽/:]",
-        "repl": "",
-    },
+    # everything else, so for a target in CJK/Arabic/Hebrew/Hangul/Devanagari/Thai it
+    # strips the whole translation -> "". Commented out so regex cleanup runs only the
+    # benign normalizations (quotes/dashes/whitespace/bracket-stripping). Re-enable
+    # ONLY if every target language uses Latin/Cyrillic/Greek script.
+    # {
+    #     "pattern": "[^ !$%',-.0123456789;?ABCDEFGHIJKLMNOPQRSßTUVWXYŸZabcdefghijklmnopqrsẞtuvwxyÿz¡£¿ÀÁÂÃÄÅÆÇÈÉÊÌÍÎÑÒÓÔÕÖØÙÚÜÝàáâãäåæçèéêëìíîïñòóôõöøùúûüýĀāĂăĄąĆćĊċČčĎďĐđĒēĖėĘęĚěĠġĢģĦħĪīĮįĶķĹĺĻļĽľŁłŃńŅņŇňŐőŒœŔŕŘřŚśŠšŤťŪūŮůŰűŲųŹźŻżŽžȘșȚțΆΈΉΌΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩάέήίαβγδεζηθικλμνξοπρστυφχψωϊόύώЁЄІЇАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяёєіїҐґ€₴₽/:]",
+    #     "repl": "",
+    # },
     {"pattern": r"\s+\.", "repl": "."},
     {"pattern": r"\?+", "repl": "?"},
     {"pattern": r"\.+", "repl": "."},
