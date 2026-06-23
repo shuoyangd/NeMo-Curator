@@ -319,6 +319,11 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                 model_kwargs["shard_size"] = args.qe_pymarian_shard_size
                 if args.qe_pymarian_args:
                     model_kwargs["marian_args"] = args.qe_pymarian_args
+                elif args.qe_cpu:
+                    # CPU marian defaults to --cpu-threads 1, which wastes the cores each
+                    # actor reserves (qe_cpus). Use them all so the actor isn't single-
+                    # threaded (otherwise QE is the pipeline's tail bottleneck).
+                    model_kwargs["marian_args"] = f"--cpu-threads {int(args.qe_cpus)} -w 2000"
             gpu = not args.qe_cpu
             qe_resources = Resources(cpus=args.qe_cpus, gpus=1.0) if gpu else Resources(cpus=args.qe_cpus)
             stages.append(
