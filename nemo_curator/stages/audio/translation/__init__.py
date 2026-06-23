@@ -21,6 +21,7 @@ from nemo_curator.stages.audio.translation.bitext_filters import (
     FinalizeTranslationStage,
 )
 from nemo_curator.stages.audio.translation.directional_writer import DirectionalShardedWriterStage
+from nemo_curator.stages.audio.translation.fake_llm_translation import FakeLLMTranslationStage
 from nemo_curator.stages.audio.translation.llm_translation import LLMTranslationStage
 from nemo_curator.stages.audio.translation.manifest_reader import (
     TranslationManifestReader,
@@ -40,6 +41,7 @@ __all__ = [
     "AudioTaskQEMarker",
     "AudioTaskRegexModifier",
     "DirectionalShardedWriterStage",
+    "FakeLLMTranslationStage",
     "FinalizeTranslationStage",
     "LLMTranslationStage",
     "TranslationExpanderStage",

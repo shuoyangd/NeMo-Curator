@@ -98,6 +98,7 @@ from nemo_curator.core.client import SlurmRayClient
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio.translation import (
     DirectionalShardedWriterStage,
+    FakeLLMTranslationStage,
     LLMTranslationStage,
     TranslationExpanderStage,
     TranslationManifestReader,
@@ -154,8 +155,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--nmt_model_id",
         type=str,
-        required=True,
-        help="Translation LLM model ID.",
+        default=None,
+        help="Translation LLM model ID (required unless --nmt_dry_run).",
+    )
+    ap.add_argument(
+        "--nmt_dry_run",
+        action="store_true",
+        help=(
+            "Use a fake CPU translator (deterministic random target-language phrases, no "
+            "vLLM/GPU) to dry-run the pipeline (filters/QE/writer/.done resume) without "
+            "loading the model."
+        ),
     )
 
     # Prompt overrides (mutually exclusive pairs)
@@ -233,15 +243,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_arg_parser().parse_args()
 
-    stages = [
-        TranslationManifestReader(
-            manifest_path=args.manifest,
-            output_dir=args.output_dir,
-            target_lang_codes=args.target_langs,
-            source_lang_key=args.source_lang_code_key,
-            input_skip_key=args.skip_me_key,
-        ),
-        LLMTranslationStage(
+    # Fake (CPU) translator for dry-runs, else the real vLLM stage. Both share the
+    # same I/O contract, so the rest of the pipeline is identical either way.
+    if args.nmt_dry_run:
+        logger.info("DRY RUN: using FakeLLMTranslationStage (no vLLM/GPU).")
+        translate_stage = FakeLLMTranslationStage(
+            text_key=args.text_key,
+            batch_size=args.nmt_batch_size,
+        )
+    else:
+        if not args.nmt_model_id:
+            raise ValueError("--nmt_model_id is required (or use --nmt_dry_run).")
+        translate_stage = LLMTranslationStage(
             model_id=args.nmt_model_id,
             translation_prompt=args.nmt_translation_prompt,
             translation_prompt_file=args.nmt_translation_prompt_file,
@@ -266,7 +279,17 @@ def main() -> None:
             repetition_penalty=args.nmt_repetition_penalty,
             seed=args.nmt_seed,
             batch_size=args.nmt_batch_size,
+        )
+
+    stages = [
+        TranslationManifestReader(
+            manifest_path=args.manifest,
+            output_dir=args.output_dir,
+            target_lang_codes=args.target_langs,
+            source_lang_key=args.source_lang_code_key,
+            input_skip_key=args.skip_me_key,
         ),
+        translate_stage,
         TranslationExpanderStage(
             source_lang_key=args.source_lang_code_key,
         ),
