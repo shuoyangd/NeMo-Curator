@@ -255,7 +255,7 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                 filter_obj=CharCountFilter(min_chars=args.cc_min_chars),
                 text_key=_TRANSLATION_FIELD,
                 score_key="tgt_char_count_score",
-                name="tgt_char_count",
+                name="TgtCharCount",
             )
         )
 
@@ -268,7 +268,7 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                 src_key=args.text_key,
                 tgt_key=_TRANSLATION_FIELD,
                 score_key="length_ratio_score",
-                name="length_ratio",
+                name="LengthRatio",
             )
         )
 
@@ -286,7 +286,7 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                 lang_key=_TARGET_LANG_FIELD,
                 text_key=_TRANSLATION_FIELD,
                 score_key="tgt_histogram_score",
-                name="tgt_histogram",
+                name="TgtHistogram",
             )
         )
 
@@ -306,13 +306,13 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                 lang_key=_TARGET_LANG_FIELD,
                 text_key=_TRANSLATION_FIELD,
                 score_key="tgt_langid_score",
-                name="tgt_langid",
+                name="TgtLangId",
             )
         )
 
     stages: list[ProcessingStage] = []
     if markers:
-        stages.append(AudioTaskMarkerChain(markers=markers, name="target_filters").with_(resources=cpu))
+        stages.append(AudioTaskMarkerChain(markers=markers, name="TargetFilters").with_(resources=cpu))
 
     # QE is a separate batched (GPU) stage; tokenizer round-trip and regex cleanup
     # are separate CPU stages. All skip rows already marked translation_skipme.
@@ -339,7 +339,8 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                     # Only the first QE model surfaces translation_quality_score; the
                     # rest only note their score / gate skip (no temp column either).
                     surface_quality=(idx == 0),
-                    name=f"qe:{model_name}",
+                    # CamelCase, colon-free stage name, e.g. cometoid-wmt23 -> QECometoidWmt23.
+                    name="QE" + "".join(part.capitalize() for part in model_name.replace("-", " ").split()),
                     model_kwargs=model_kwargs,
                 ).with_(resources=qe_resources, batch_size=args.qe_batch_size)
             )

@@ -207,7 +207,7 @@ class AudioTaskFieldMarker(ProcessingStage[AudioTask, AudioTask]):
     lang_key: str | None = None
     text_key: str = ""
     score_key: str = ""
-    name: str = "field_marker"
+    name: str = "FieldMarker"
     skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
 
@@ -300,7 +300,7 @@ class AudioTaskBitextMarker(ProcessingStage[AudioTask, AudioTask]):
     src_key: str = ""
     tgt_key: str = ""
     score_key: str = ""
-    name: str = "bitext_marker"
+    name: str = "BitextMarker"
     skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
 
@@ -367,7 +367,7 @@ class AudioTaskMarkerChain(ProcessingStage[AudioTask, AudioTask]):
     """
 
     markers: list[Any] = field(default_factory=list)
-    name: str = "marker_chain"
+    name: str = "MarkerChain"
     notes_key: str = NOTES_KEY
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -431,7 +431,7 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
     score_key: str = "qe_score"
     quality_key: str = "translation_quality_score"
     surface_quality: bool = True
-    name: str = "qe_filter"
+    name: str = "QEFilter"
     skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
     model_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -517,7 +517,7 @@ class TokenizerRoundTripStage(ProcessingStage[AudioTask, AudioTask]):
 
     model_id: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
     text_key: str = "translation"
-    name: str = "tokenizer_roundtrip"
+    name: str = "TokenizerRoundTrip"
     skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
     trust_remote_code: bool = True
@@ -573,7 +573,7 @@ class AudioTaskRegexModifier(ProcessingStage[AudioTask, AudioTask]):
 
     field_key: str = "translation"
     regex_params: list[dict[str, str]] = field(default_factory=lambda: REGEX_PARAMS_LIST)
-    name: str = "regex_cleanup"
+    name: str = "RegexCleanup"
     skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
 
@@ -623,7 +623,7 @@ class FinalizeTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     quality_key: str = "translation_quality_score"
     skip_key: str = WORK_SKIP_KEY
     source_text_key: str = "pnc_text"
-    name: str = "finalize_translation"
+    name: str = "FinalizeTranslation"
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
