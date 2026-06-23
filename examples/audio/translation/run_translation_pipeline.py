@@ -41,7 +41,7 @@ Architecture
     build_bitext_filter_stages    (CPU/GPU, AudioTask → AudioTask)  [opt-in]
         Post-translation mark-only filters on (source, translation):
         tgt character count, length ratio, histogram/fastText, QE,
-        tokenizer round-trip, regex cleanup, then a finalize step.
+        regex cleanup, then a finalize step.
         Rows are annotated (translation_skipme + additional_notes) but
         never dropped, so the writer's per-direction .done counting holds.
         (No source-side pre-translation filtering.)

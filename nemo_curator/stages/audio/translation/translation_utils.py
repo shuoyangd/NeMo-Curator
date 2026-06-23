@@ -189,16 +189,6 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
     qe.add_argument("--qe_pymarian_shard_size", type=int, default=5000)
     qe.add_argument("--qe_pymarian_args", type=str, default=None)
 
-    trt = parser.add_argument_group("bitext filtering: tokenizer round-trip")
-    trt.add_argument(
-        "--tokenizer_roundtrip", action="store_true",
-        help="Enable a tokenizer encode->decode round-trip check on the translation; mismatches are marked skip.",
-    )
-    trt.add_argument(
-        "--tokenizer_roundtrip_model", type=str, default="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-        help="Model whose tokenizer is used for the round-trip check (tokenizer only; no model weights loaded).",
-    )
-
     regex = parser.add_argument_group("bitext filtering: regex cleanup")
     regex.add_argument(
         "--regex_cleanup", action="store_true",
@@ -238,7 +228,6 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
         CharCountFilter,
         CharLengthRatioFilter,
         FinalizeTranslationStage,
-        TokenizerRoundTripStage,
     )
 
     _require_fasttext_model(args, "--langid_tgt", args.langid_tgt)
@@ -314,8 +303,9 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
     if markers:
         stages.append(AudioTaskMarkerChain(markers=markers, name="TargetFilters").with_(resources=cpu))
 
-    # QE is a separate batched (GPU) stage; tokenizer round-trip and regex cleanup
-    # are separate CPU stages. All skip rows already marked translation_skipme.
+    # QE is a separate batched (GPU) stage; it scores rows not already marked
+    # translation_skipme (score-only — it never skips). Regex cleanup is a separate
+    # CPU stage that also skips already-marked rows.
     if args.qe:
         for idx, model_name in enumerate(args.qe_models):
             model_kwargs: dict[str, Any] = {}
@@ -344,14 +334,6 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                     model_kwargs=model_kwargs,
                 ).with_(resources=qe_resources, batch_size=args.qe_batch_size)
             )
-
-    # Tokenizer round-trip is a separate actor stage (loads a tokenizer in setup()).
-    if args.tokenizer_roundtrip:
-        stages.append(
-            TokenizerRoundTripStage(
-                model_id=args.tokenizer_roundtrip_model, text_key=_TRANSLATION_FIELD
-            ).with_(resources=cpu)
-        )
 
     if args.regex_cleanup:
         stages.append(AudioTaskRegexModifier(field_key=_TRANSLATION_FIELD).with_(resources=cpu))

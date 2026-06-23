@@ -415,19 +415,21 @@ class AudioTaskMarkerChain(ProcessingStage[AudioTask, AudioTask]):
 
 @dataclass
 class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
-    """Mark rows below a quality-estimation cutoff, batching the model call.
+    """Score each translation with a quality-estimation model (score-only).
 
     ``setup()`` loads the QE model once per worker (``COMET`` or ``PyMarian``
     Cometoid). ``process_batch`` gathers every not-yet-skipped row, builds QE
     inputs (per-row direction handling for ``always_en_x`` / ``bidi``), runs a
-    single ``model.predict(...)``, records the score in ``additional_notes``, and
-    marks rows scoring below ``cutoff``. This is the only filter that needs a real
-    batch.
+    single ``model.predict(...)``, and records the score in ``additional_notes``
+    (flagging scores below ``cutoff`` as ``(low)``). This is the only filter that
+    needs a real batch.
 
-    When ``surface_quality`` is set, the score is also written to ``quality_key``
-    (``translation_quality_score``) so it becomes the row's final quality score —
-    no temporary per-model score column is left behind. With several QE models
-    only the first surfaces its score (the rest add notes / gate skip only).
+    QE **does not drop rows** — it never sets ``translation_skipme``; ``cutoff`` is
+    used only to annotate low scores in the note. When ``surface_quality`` is set,
+    the score is also written to ``quality_key`` (``translation_quality_score``) so
+    it becomes the row's final quality score (good or low) — no temporary per-model
+    score column is left behind. With several QE models only the first surfaces its
+    score (the rest only add notes).
     """
 
     model_name: str
@@ -479,13 +481,14 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
         scores = self._score(pending)
         for task, score in zip(pending, scores, strict=True):
             value = float(score)
-            _add_note(task, self.name, f"applied ({self.score_key}={value:.4f})", self.notes_key)
+            # Score-only: record the score (and flag if below cutoff) but NEVER set
+            # translation_skipme — QE annotates quality, it does not drop rows.
+            detail = f"{self.score_key}={value:.4f}"
+            if value < self.cutoff:
+                detail += f"<{self.cutoff} (low)"
+            _add_note(task, self.name, f"applied ({detail})", self.notes_key)
             if self.surface_quality:
                 task.data[self.quality_key] = value
-            if value < self.cutoff:
-                _set_skip(task, self.name, self.skip_key)
-            else:
-                task.data.setdefault(self.skip_key, "")
         return tasks
 
     def _score(self, pending: list[AudioTask]) -> list[float]:
@@ -511,63 +514,6 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
         all_scores = [float(score) for score in self.model.predict(forward + reverse)]
         mid = len(forward)
         return [(fwd + rev) / 2 for fwd, rev in zip(all_scores[:mid], all_scores[mid:], strict=True)]
-
-
-@dataclass
-class TokenizerRoundTripStage(ProcessingStage[AudioTask, AudioTask]):
-    """Mark rows whose text doesn't survive a tokenizer encode->decode round-trip.
-
-    Loads ONLY the tokenizer (no model weights) for ``model_id`` in ``setup()``.
-    Per row it encodes ``text_key`` (no special tokens) and decodes back; if the
-    decoded text differs from the original (the tokenizer can't faithfully
-    represent it — e.g. characters map to <unk> or get dropped), the row is marked
-    ``translation_skipme=1`` with an ``additional_notes`` note. Mark-only;
-    already-skipped rows are left untouched.
-    """
-
-    model_id: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
-    text_key: str = "translation"
-    name: str = "TokenizerRoundTrip"
-    skip_key: str = WORK_SKIP_KEY
-    notes_key: str = NOTES_KEY
-    trust_remote_code: bool = True
-    tokenizer: Any = None
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.text_key]
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.notes_key]
-
-    def ray_stage_spec(self) -> dict[str, Any]:
-        return {RayStageSpecKeys.IS_ACTOR_STAGE: True}
-
-    def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
-        from transformers import AutoTokenizer
-
-        # Tokenizer files only — no model weights are downloaded/loaded.
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=self.trust_remote_code)
-
-    def process(self, task: AudioTask) -> AudioTask:
-        return self.process_batch([task])[0]
-
-    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
-        if self.tokenizer is None:
-            msg = "Tokenizer not initialised — setup() was not called"
-            raise RuntimeError(msg)
-        for task in tasks:
-            if _is_skipped(task, self.skip_key):
-                continue
-            text = str(task.data.get(self.text_key, "") or "")
-            if not text.strip():
-                continue
-            ids = self.tokenizer.encode(text, add_special_tokens=False)
-            decoded = self.tokenizer.decode(ids, skip_special_tokens=True)
-            bad = decoded.strip() != text.strip()
-            _add_note(task, self.name, f"applied (tokenizer_roundtrip={'mismatch' if bad else 'ok'})", self.notes_key)
-            if bad:
-                _set_skip(task, self.name, self.skip_key)
-        return tasks
 
 
 @dataclass
@@ -675,5 +621,4 @@ __all__ = [
     "FinalizeTranslationStage",
     "REGEX_PARAMS_LIST",
     "RegexSubstitutionModifier",
-    "TokenizerRoundTripStage",
 ]
