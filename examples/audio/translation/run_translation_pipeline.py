@@ -248,9 +248,8 @@ def main() -> None:
             system_prompt=args.nmt_system_prompt,
             system_prompt_file=args.nmt_system_prompt_file,
             text_key=args.text_key,
-            # Honor the working flag (seeded from the input skip column by the reader),
-            # so input-flagged rows AND source-prefilter rejects skip vLLM.
-            skip_me_key="translation_skipme",
+            # skip_me_key defaults to the working flag (translation_skipme), which the
+            # reader seeds from the input skip column — so input-flagged rows skip vLLM.
             tensor_parallel_size=args.nmt_tensor_parallel_size,
             num_workers_override=args.nmt_num_workers,
             max_output_tokens=args.nmt_max_output_tokens,

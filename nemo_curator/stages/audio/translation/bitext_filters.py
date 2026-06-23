@@ -50,8 +50,10 @@ if TYPE_CHECKING:
     from nemo_curator.stages.text.filters.bitext import BitextFilter
     from nemo_curator.stages.text.filters.doc_filter import DocumentFilter
 
-SKIP_KEY = "_skipme"  # original input flag — never written by filters
-WORK_SKIP_KEY = "translation_skipme"  # working flag the filters/LLM gate on (seeded from _skipme)
+# Working skip flag every filter/LLM gates on. The reader seeds it from the input
+# skip column (the ONLY place that reads the original ``_skipme``); nothing here
+# touches the original flag.
+WORK_SKIP_KEY = "translation_skipme"
 NOTES_KEY = "additional_notes"
 
 # Fixed regex cleanup applied to the translated field (ported verbatim from the
@@ -101,14 +103,22 @@ REGEX_PARAMS_LIST: list[dict[str, str]] = [
 ]
 
 
-def _is_skipped(task: AudioTask, skip_key: str = SKIP_KEY) -> bool:
-    """True when an upstream filter already marked this row for skipping."""
-    return bool(task.data.get(skip_key, 0))
+def _is_skipped(task: AudioTask, skip_key: str = WORK_SKIP_KEY) -> bool:
+    """True when this row is already marked for skipping (non-empty reason string)."""
+    return bool(task.data.get(skip_key, ""))
 
 
-def _set_skip(task: AudioTask, skip_key: str = WORK_SKIP_KEY) -> None:
-    """Set the working skip gate. The reason is recorded separately by ``_add_note``."""
-    task.data[skip_key] = 1
+def _set_skip(task: AudioTask, reason: str, skip_key: str = WORK_SKIP_KEY) -> None:
+    """Mark the row skipped by writing the **reason** string into the working gate.
+
+    The gate is a string (like the input ``_skipme``): empty = keep, non-empty =
+    skip-because-of-``reason`` (typically the stage name that rejected it). Written
+    only on the **first** skip — an already-set reason is preserved (first reason
+    wins), matching the per-row short-circuit in the markers. The full score is also
+    recorded in ``additional_notes`` by ``_add_note``.
+    """
+    if not task.data.get(skip_key):
+        task.data[skip_key] = reason
 
 
 def _add_note(task: AudioTask, stage_name: str, detail: str, notes_key: str = NOTES_KEY) -> None:
@@ -262,9 +272,9 @@ class AudioTaskFieldMarker(ProcessingStage[AudioTask, AudioTask]):
         score = filter_obj.score_document(text)
         _add_note(task, self.name, f"applied ({self.score_key}={score})", self.notes_key)
         if not filter_obj.keep_document(score):
-            _set_skip(task, self.skip_key)
+            _set_skip(task, self.name, self.skip_key)
             return True
-        task.data.setdefault(self.skip_key, 0)
+        task.data.setdefault(self.skip_key, "")
         return False
 
     def process(self, task: AudioTask) -> AudioTask:
@@ -338,9 +348,9 @@ class AudioTaskBitextMarker(ProcessingStage[AudioTask, AudioTask]):
         score = filter_obj.score_bitext(src, tgt)
         _add_note(task, self.name, f"applied ({self.score_key}={score})", self.notes_key)
         if not filter_obj.keep_bitext(score):
-            _set_skip(task, self.skip_key)
+            _set_skip(task, self.name, self.skip_key)
             return True
-        task.data.setdefault(self.skip_key, 0)
+        task.data.setdefault(self.skip_key, "")
         return False
 
     def process(self, task: AudioTask) -> AudioTask:
@@ -473,9 +483,9 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
             if self.surface_quality:
                 task.data[self.quality_key] = value
             if value < self.cutoff:
-                _set_skip(task, self.skip_key)
+                _set_skip(task, self.name, self.skip_key)
             else:
-                task.data.setdefault(self.skip_key, 0)
+                task.data.setdefault(self.skip_key, "")
         return tasks
 
     def _score(self, pending: list[AudioTask]) -> list[float]:
@@ -556,7 +566,7 @@ class TokenizerRoundTripStage(ProcessingStage[AudioTask, AudioTask]):
             bad = decoded.strip() != text.strip()
             _add_note(task, self.name, f"applied (tokenizer_roundtrip={'mismatch' if bad else 'ok'})", self.notes_key)
             if bad:
-                _set_skip(task, self.skip_key)
+                _set_skip(task, self.name, self.skip_key)
         return tasks
 
 

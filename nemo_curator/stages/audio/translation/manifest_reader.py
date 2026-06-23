@@ -314,8 +314,12 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 # stages (filters, writer) don't depend on the input column name.
                 row[SOURCE_LANG_CODE_KEY] = src_raw
                 # Seed the working skip flag from the original input flag (left
-                # untouched). All filters and the LLM gate on translation_skipme.
-                row[TRANSLATION_SKIP_KEY] = int(bool(row.get(self.input_skip_key, 0)))
+                # untouched). It is a reason STRING like the input ``_skipme``: copy
+                # the original reason when set, else "" (keep). All filters and the LLM
+                # gate on translation_skipme; downstream filters overwrite "" with their
+                # own reason on the first rejection (first reason wins).
+                original_skip = row.get(self.input_skip_key)
+                row[TRANSLATION_SKIP_KEY] = str(original_skip) if original_skip else ""
                 row[self.translate_to_key] = target_names
 
                 for tgt_norm in self._row_targets(src_norm):

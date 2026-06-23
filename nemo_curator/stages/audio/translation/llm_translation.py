@@ -30,6 +30,7 @@ from nemo_curator.stages.audio.pipeline_utils import set_note
 from nemo_curator.stages.audio.translation.translation_utils import (
     SOURCE_LANG_NAME_KEY,
     TRANSLATE_TO_KEY,
+    TRANSLATION_SKIP_KEY,
     TRANSLATIONS_KEY,
 )
 from nemo_curator.stages.base import ProcessingStage
@@ -108,7 +109,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     source_lang_key: str = SOURCE_LANG_NAME_KEY
     target_lang_key: str = TRANSLATE_TO_KEY
     translations_key: str = TRANSLATIONS_KEY
-    skip_me_key: str = "_skipme"
+    skip_me_key: str = TRANSLATION_SKIP_KEY
     notes_key: str = "additional_notes"
     tensor_parallel_size: int | None = None
     max_output_tokens: int = 256
