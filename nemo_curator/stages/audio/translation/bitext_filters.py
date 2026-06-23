@@ -32,6 +32,7 @@ and the QE ``QEModel`` wrappers, applied per row, so there is no
 
 from __future__ import annotations
 
+import ast
 import math
 import re
 from dataclasses import dataclass, field
@@ -104,6 +105,30 @@ REGEX_PARAMS_LIST: list[dict[str, str]] = [
 ]
 
 
+def _fmt_score(score: Any) -> str:
+    """Render a filter score for notes / skip reasons, rounding floats to 2 digits.
+
+    Handles ints (char counts), floats (ratios / confidences), lists/tuples, and the
+    stringified ``[confidence, lang]`` that ``FastTextLangId.score_document`` returns
+    (rounding the confidence, keeping the language tag).
+    """
+    if isinstance(score, bool):
+        return str(score)
+    if isinstance(score, float):
+        return f"{score:.2f}"
+    if isinstance(score, (list, tuple)):
+        return "[" + ", ".join(_fmt_score(x) for x in score) + "]"
+    if isinstance(score, str):
+        try:
+            parsed = ast.literal_eval(score)
+        except (ValueError, SyntaxError):
+            return score
+        if isinstance(parsed, (list, tuple, float)):
+            return _fmt_score(parsed)
+        return score
+    return str(score)
+
+
 def _is_skipped(task: AudioTask, skip_key: str = WORK_SKIP_KEY) -> bool:
     """True when this row is already marked for skipping (non-empty reason string)."""
     return bool(task.data.get(skip_key, ""))
@@ -113,10 +138,11 @@ def _set_skip(task: AudioTask, reason: str, skip_key: str = WORK_SKIP_KEY) -> No
     """Mark the row skipped by writing the **reason** string into the working gate.
 
     The gate is a string (like the input ``_skipme``): empty = keep, non-empty =
-    skip-because-of-``reason`` (typically the stage name that rejected it). Written
-    only on the **first** skip — an already-set reason is preserved (first reason
-    wins), matching the per-row short-circuit in the markers. The full score is also
-    recorded in ``additional_notes`` by ``_add_note``.
+    skip-because-of-``reason`` — a verbose ``"<StageName> (<score_key>=<value>)"``
+    describing which filter rejected the row and its score. Written only on the
+    **first** skip — an already-set reason is preserved (first reason wins), matching
+    the per-row short-circuit in the markers. The same score is also recorded in
+    ``additional_notes`` by ``_add_note``.
     """
     if not task.data.get(skip_key):
         task.data[skip_key] = reason
@@ -271,9 +297,10 @@ class AudioTaskFieldMarker(ProcessingStage[AudioTask, AudioTask]):
             return False
         text = str(task.data.get(self.text_key, "") or "")
         score = filter_obj.score_document(text)
-        _add_note(task, self.name, f"applied ({self.score_key}={score})", self.notes_key)
+        detail = f"{self.score_key}={_fmt_score(score)}"
+        _add_note(task, self.name, f"applied ({detail})", self.notes_key)
         if not filter_obj.keep_document(score):
-            _set_skip(task, self.name, self.skip_key)
+            _set_skip(task, f"{self.name} ({detail})", self.skip_key)
             return True
         task.data.setdefault(self.skip_key, "")
         return False
@@ -347,9 +374,10 @@ class AudioTaskBitextMarker(ProcessingStage[AudioTask, AudioTask]):
         src = str(task.data.get(self.src_key, "") or "")
         tgt = str(task.data.get(self.tgt_key, "") or "")
         score = filter_obj.score_bitext(src, tgt)
-        _add_note(task, self.name, f"applied ({self.score_key}={score})", self.notes_key)
+        detail = f"{self.score_key}={_fmt_score(score)}"
+        _add_note(task, self.name, f"applied ({detail})", self.notes_key)
         if not filter_obj.keep_bitext(score):
-            _set_skip(task, self.name, self.skip_key)
+            _set_skip(task, f"{self.name} ({detail})", self.skip_key)
             return True
         task.data.setdefault(self.skip_key, "")
         return False
@@ -484,7 +512,7 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
             value = float(score)
             # Score-only: record the score (and flag if below cutoff) but NEVER set
             # translation_skipme — QE annotates quality, it does not drop rows.
-            detail = f"{self.score_key}={value:.4f}"
+            detail = f"{self.score_key}={_fmt_score(value)}"
             if value < self.cutoff:
                 detail += f"<{self.cutoff} (low)"
             _add_note(task, self.name, f"applied ({detail})", self.notes_key)
@@ -573,7 +601,8 @@ class FinalizeTranslationStage(ProcessingStage[AudioTask, AudioTask]):
       is reset to ``""`` (empty source is not a skip in the output — the sentinel
       quality 1 marks it);
     - filtered (any other reason — a filter name or an input ``_skipme`` reason):
-      empty ``translation`` + ``translation_raw``, ``translation_quality_score = None``;
+      empty ``translation`` but KEEP ``translation_raw`` (the verbatim LLM output, so
+      the rejected text stays auditable), ``translation_quality_score = None``;
     - kept (reason ``""``): ``translation_quality_score`` = the QE score already
       written by the QE stage (``None`` when QE is off / didn't run).
     """
@@ -606,9 +635,10 @@ class FinalizeTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 data[self.quality_key] = 1
                 data[self.skip_key] = ""
             elif reason:
-                # Filtered (a filter name, or an input _skipme reason): drop translation.
+                # Filtered (a filter name, or an input _skipme reason): empty the final
+                # translation but KEEP translation_raw (the verbatim LLM output) so the
+                # rejected text stays auditable.
                 data[self.translation_key] = ""
-                data[self.translation_raw_key] = ""
                 data[self.quality_key] = None
             else:
                 # Kept: keep the QE score the QE stage surfaced, else None.
