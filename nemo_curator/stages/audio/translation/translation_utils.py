@@ -52,8 +52,14 @@ SOURCE_LANG_CODE_KEY = "source_lang"
 
 # Working skip flag for the filtering pipeline. The reader seeds it from the input
 # ``_skipme`` column; all filter markers and the LLM gate on THIS field, leaving the
-# original ``_skipme`` untouched.
+# original ``_skipme`` untouched. It is a reason STRING ("" = keep).
 TRANSLATION_SKIP_KEY = "translation_skipme"
+
+# Reserved ``translation_skipme`` reason set by LLMTranslationStage when the source
+# text is empty/whitespace: an expected empty translation, NOT a quality rejection.
+# Filters short-circuit it (it's a non-empty skip reason) and FinalizeTranslationStage
+# maps it to the empty-source sentinel instead of the filtered outcome.
+EMPTY_SOURCE_REASON = "empty_source"
 
 # Internal scratch keys (never appear in the output manifest).
 SOURCE_LANG_NAME_KEY = "source_lang_name"
@@ -338,9 +344,9 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
     if args.regex_cleanup:
         stages.append(AudioTaskRegexModifier(field_key=_TRANSLATION_FIELD).with_(resources=cpu))
 
-    # Finalize (always): normalize the translation fields for the filtered /
-    # empty-source / kept cases. Each upstream stage already cleaned up its own
-    # temporary fields, so finalize only sets translation/raw/quality.
-    stages.append(FinalizeTranslationStage(source_text_key=args.text_key).with_(resources=cpu))
+    # Finalize (always): normalize the translation fields for the empty-source /
+    # filtered / kept cases (driven by the translation_skipme reason). Each upstream
+    # stage already cleaned up its own temporary fields.
+    stages.append(FinalizeTranslationStage().with_(resources=cpu))
 
     return stages

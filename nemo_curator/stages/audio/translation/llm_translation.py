@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 from nemo_curator.stages.audio.pipeline_utils import set_note
 from nemo_curator.stages.audio.translation.translation_utils import (
+    EMPTY_SOURCE_REASON,
     SOURCE_LANG_NAME_KEY,
     TRANSLATE_TO_KEY,
     TRANSLATION_SKIP_KEY,
@@ -419,7 +420,11 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
 
             text = data.get(self.text_key, "")
             if not text or not text.strip():
-                # Empty source text: nothing to translate, emit empty translations.
+                # Empty source text: nothing to translate. Mark the working flag with
+                # the reserved reason so downstream filters short-circuit it and
+                # FinalizeTranslationStage classifies it as the empty-source case
+                # (not a quality rejection), regardless of which filters are enabled.
+                data[self.skip_me_key] = EMPTY_SOURCE_REASON
                 self._emit_empty_translations(task, targets, "applied (empty_text_skipped)")
                 continue
 

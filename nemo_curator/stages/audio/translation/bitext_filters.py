@@ -42,6 +42,7 @@ from loguru import logger
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.audio.pipeline_utils import set_note
 from nemo_curator.stages.audio.translation.language_map import _normalize_code
+from nemo_curator.stages.audio.translation.translation_utils import EMPTY_SOURCE_REASON
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask
 
@@ -564,21 +565,23 @@ class FinalizeTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     in ``additional_notes`` and leave no temporary column; QE writes the surfaced
     ``translation_quality_score`` directly; the expander strips its scratch keys),
     so the output is just the input fields + the translation fields and this stage
-    only normalizes the three cases:
+    only normalizes, **driven by the ``translation_skipme`` reason string**, three
+    cases:
 
-    - filtered (``skip_key`` set): empty ``translation`` + ``translation_raw``,
-      ``translation_quality_score = None``;
-    - empty/space source: empty ``translation`` + ``translation_raw``,
-      ``translation_quality_score = 1`` (distinct from a filtered row);
-    - kept: ``translation_quality_score`` = the QE score already written by the QE
-      stage (``None`` when QE is off / didn't run).
+    - empty source (reason ``"empty_source"``, set by the LLM): empty ``translation``
+      + ``translation_raw``, ``translation_quality_score = 1``, and the working flag
+      is reset to ``""`` (empty source is not a skip in the output — the sentinel
+      quality 1 marks it);
+    - filtered (any other reason — a filter name or an input ``_skipme`` reason):
+      empty ``translation`` + ``translation_raw``, ``translation_quality_score = None``;
+    - kept (reason ``""``): ``translation_quality_score`` = the QE score already
+      written by the QE stage (``None`` when QE is off / didn't run).
     """
 
     translation_key: str = "translation"
     translation_raw_key: str = "translation_raw"
     quality_key: str = "translation_quality_score"
     skip_key: str = WORK_SKIP_KEY
-    source_text_key: str = "pnc_text"
     name: str = "FinalizeTranslation"
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -593,17 +596,20 @@ class FinalizeTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
         for task in tasks:
             data = task.data
-            if data.get(self.skip_key):
-                # Filtered out by a quality stage: empty translation + raw, quality None.
-                data[self.translation_key] = ""
-                data[self.translation_raw_key] = ""
-                data[self.quality_key] = None
-            elif not str(data.get(self.source_text_key, "") or "").strip():
-                # Empty/space source — nothing to translate. A distinct case from a
-                # filtered row (NOT translation_skipme); sentinel quality 1.
+            reason = data.get(self.skip_key) or ""
+            if reason == EMPTY_SOURCE_REASON:
+                # Empty source — expected empty translation, not a quality rejection.
+                # Reset the working flag to "" (empty source is NOT a skip in the
+                # output); the sentinel quality 1 marks the case.
                 data[self.translation_key] = ""
                 data[self.translation_raw_key] = ""
                 data[self.quality_key] = 1
+                data[self.skip_key] = ""
+            elif reason:
+                # Filtered (a filter name, or an input _skipme reason): drop translation.
+                data[self.translation_key] = ""
+                data[self.translation_raw_key] = ""
+                data[self.quality_key] = None
             else:
                 # Kept: keep the QE score the QE stage surfaced, else None.
                 data.setdefault(self.quality_key, None)
