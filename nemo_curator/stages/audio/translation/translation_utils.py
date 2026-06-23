@@ -189,6 +189,11 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
     qe.add_argument("--qe_mode", choices=["simple", "always_en_x", "bidi"], default="always_en_x")
     qe.add_argument("--qe_cpu", action="store_true", help="Run QE on CPU (avoids GPU contention with vLLM).")
     qe.add_argument("--qe_cpus", type=float, default=1.0)
+    qe.add_argument(
+        "--qe_num_workers", type=int, default=None,
+        help="Pin the QE actor-pool size (default: autoscale to fill CPUs). A small value "
+             "cuts startup time — fewer actors means fewer model loads.",
+    )
     qe.add_argument("--qe_batch_size", type=int, default=64)
     qe.add_argument("--qe_comet_cutoff", type=float, default=-0.5)
     qe.add_argument("--qe_pymarian_cutoff", type=float, default=0.6)
@@ -340,6 +345,7 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                     # Only the first QE model surfaces translation_quality_score; the
                     # rest only note their score / gate skip (no temp column either).
                     surface_quality=(idx == 0),
+                    num_workers_override=args.qe_num_workers,
                     # CamelCase, colon-free stage name, e.g. cometoid-wmt23 -> QECometoidWmt23.
                     name="QE" + "".join(part.capitalize() for part in model_name.replace("-", " ").split()),
                     model_kwargs=model_kwargs,

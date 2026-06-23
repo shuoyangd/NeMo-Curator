@@ -475,6 +475,7 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
     name: str = "QEFilter"
     skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
+    num_workers_override: int | None = None
     model_kwargs: dict[str, Any] = field(default_factory=dict)
     model: Any = None
 
@@ -486,6 +487,18 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
 
     def ray_stage_spec(self) -> dict[str, Any]:
         return {RayStageSpecKeys.IS_ACTOR_STAGE: True}
+
+    def num_workers(self) -> int | None:
+        # Pin the actor-pool size when set (else the backend autoscales to fill CPUs,
+        # which spawns many actors — each a slow model load at startup). Capping it
+        # cuts warmup; throughput is unaffected since each actor uses qe_cpus threads.
+        return self.num_workers_override
+
+    def xenna_stage_spec(self) -> dict[str, Any]:
+        spec: dict[str, Any] = {}
+        if self.num_workers_override is not None:
+            spec["num_workers"] = self.num_workers_override
+        return spec
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         from nemo_curator.stages.text.filters.qe import QualityEstimationFilter
