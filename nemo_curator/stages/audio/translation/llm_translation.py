@@ -38,11 +38,12 @@ from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
 
-try:
-    from vllm import LLM, SamplingParams
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
+# NOTE: vLLM (and therefore torch) is imported lazily inside _init_model(), NOT at
+# module top level. This module is pulled in by the translation package __init__, so a
+# top-level `import vllm` would load torch into EVERY actor in the package — including the
+# cometoid/PyMarian QE actor, whose Marian CUDA runtime then segfaults colliding with
+# torch's. Keeping the import lazy lets the QE actor stay torch-free (pymarian needs no
+# torch), so cometoid QE runs on GPU in-pipeline.
 
 _DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "translation_prompt.md"
 _DEFAULT_SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "system_prompt.md"
@@ -205,8 +206,13 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # ------------------------------------------------------------------
 
     def _init_model(self) -> None:
-        if not VLLM_AVAILABLE:
-            raise ImportError("vLLM is required for LLMTranslationStage. pip install vllm")
+        # Imported here (not at module top level) so loading this module — and thus the
+        # translation package __init__ — never pulls torch into non-LLM actors (e.g. the
+        # pymarian QE actor, which segfaults if torch's CUDA runtime is also loaded).
+        try:
+            from vllm import LLM, SamplingParams
+        except ImportError as e:
+            raise ImportError("vLLM is required for LLMTranslationStage. pip install vllm") from e
 
         # Isolate this process's compile caches BEFORE building the engine, so
         # co-located engines don't race on the shared inductor/triton cache.
