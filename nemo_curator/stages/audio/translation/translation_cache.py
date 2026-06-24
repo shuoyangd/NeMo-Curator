@@ -45,7 +45,7 @@ from loguru import logger
 from nemo_curator.stages.audio.translation.language_map import name_to_code
 
 if TYPE_CHECKING:
-    from diskcache import Cache
+    from diskcache import FanoutCache
 
 # diskcache uses 1 GiB as its own default; we expose larger, pair-specific budgets.
 _GIB = 1 << 30
@@ -53,16 +53,29 @@ _GIB = 1 << 30
 
 @dataclass
 class TranslationCache:
-    """Per-language-pair on-disk LFU cache for short translations (fail-open)."""
+    """Per-language-pair on-disk LFU cache for short translations (fail-open).
+
+    Each pair uses a :class:`diskcache.FanoutCache` (not a plain ``Cache``): the
+    translation actors are separate processes sharing one on-disk cache per pair,
+    and a plain ``Cache`` is a single SQLite database with one writer lock. Under
+    the ``least-frequently-used`` policy *every* ``get`` is a write (it bumps the
+    access count), so all replicas serialize on that one lock and stall each other
+    — leaving the GPUs idle. ``FanoutCache`` shards keys across ``shards`` separate
+    SQLite databases, so distinct keys never contend; and a short ``timeout`` makes
+    the rare same-shard collision fail open to a miss (caught below) instead of
+    blocking a GPU actor for the 60 s diskcache default.
+    """
 
     cache_dir: str
     max_chars: int = 40
     size_limit: int = _GIB           # budget per x->en pair
     size_limit_en: int = 5 * _GIB    # budget per en->x pair (English source dominates)
     eviction_policy: str = "least-frequently-used"
+    shards: int = 8                  # SQLite DBs per pair; spreads the writer lock
+    timeout: float = 0.1             # s; contended op fails open (miss/no-op) vs blocking the GPU
 
     _ok: bool = field(default=False, init=False, repr=False)
-    _caches: dict[tuple[str, str], "Cache"] = field(default_factory=dict, init=False, repr=False)
+    _caches: dict[tuple[str, str], "FanoutCache"] = field(default_factory=dict, init=False, repr=False)
 
     def open(self) -> None:
         """Prepare the cache root and confirm diskcache is importable (fail-open)."""
@@ -85,16 +98,18 @@ class TranslationCache:
         """Stable key for ``(model, source_text)``; the pair is the directory."""
         return hashlib.sha256(f"{model_id}\x1f{text}".encode()).hexdigest()
 
-    def _pair_cache(self, src_iso: str, tgt_iso: str) -> "Cache":
-        """Memoized per-pair ``Cache`` (en-source pairs get the larger budget)."""
+    def _pair_cache(self, src_iso: str, tgt_iso: str) -> "FanoutCache":
+        """Memoized per-pair sharded cache (en-source pairs get the larger budget)."""
         pair = (src_iso, tgt_iso)
         cache = self._caches.get(pair)
         if cache is None:
-            from diskcache import Cache
+            from diskcache import FanoutCache
 
             limit = self.size_limit_en if src_iso == "en" else self.size_limit
-            cache = Cache(
+            cache = FanoutCache(
                 directory=os.path.join(self.cache_dir, f"{src_iso}-{tgt_iso}"),
+                shards=self.shards,
+                timeout=self.timeout,
                 size_limit=limit,
                 eviction_policy=self.eviction_policy,
             )
