@@ -211,38 +211,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--nmt_repetition_penalty", type=float, default=1.0)
     ap.add_argument("--nmt_seed", type=int, default=1234)
 
-    # On-disk LFU cache for short translations (per language pair). Identical short
-    # source utterances are served from disk instead of re-running the LLM.
-    ap.add_argument(
-        "--nmt_cache",
-        action="store_true",
-        help="Enable the on-disk LFU translation cache for short source texts.",
-    )
-    ap.add_argument(
-        "--nmt_cache_dir",
-        type=str,
-        default=None,
-        help="Root directory for the translation cache (one subdir per src-tgt pair).",
-    )
-    ap.add_argument(
-        "--nmt_cache_max_chars",
-        type=int,
-        default=40,
-        help="Only cache source texts whose stripped length is <= this many characters.",
-    )
-    ap.add_argument(
-        "--nmt_cache_size_limit",
-        type=int,
-        default=1 << 30,
-        help="Per-pair cache size limit in bytes for x->en pairs (default 1 GiB).",
-    )
-    ap.add_argument(
-        "--nmt_cache_size_limit_en",
-        type=int,
-        default=5 << 30,
-        help="Per-pair cache size limit in bytes for en->x pairs (default 5 GiB).",
-    )
-
     # ------------------------------------------------------------------ Executor
     ap.add_argument(
         "--execution_mode",
@@ -311,11 +279,6 @@ def main() -> None:
             repetition_penalty=args.nmt_repetition_penalty,
             seed=args.nmt_seed,
             batch_size=args.nmt_batch_size,
-            cache_enabled=args.nmt_cache,
-            cache_dir=args.nmt_cache_dir,
-            cache_max_chars=args.nmt_cache_max_chars,
-            cache_size_limit=args.nmt_cache_size_limit,
-            cache_size_limit_en=args.nmt_cache_size_limit_en,
         )
 
     stages = [
