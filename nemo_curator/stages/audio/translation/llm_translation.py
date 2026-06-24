@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
 from nemo_curator.stages.audio.pipeline_utils import set_note
+from nemo_curator.stages.audio.translation.translation_cache import WorkerTranslationCache
 from nemo_curator.stages.audio.translation.translation_utils import (
     EMPTY_SOURCE_REASON,
     SOURCE_LANG_NAME_KEY,
@@ -131,7 +132,15 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
     batch_size: int = 512
 
+    # Lock-free per-worker translation cache (warm start from a canonical file, dumped per
+    # worker at teardown, merged by the driver after the run). See translation_cache.py.
+    cache_enabled: bool = False
+    cache_dir: str | None = None
+    cache_run_id: str | None = None
+    cache_max_chars: int = 40
+
     _llm: Any = field(default=None, init=False, repr=False)
+    _cache: Any = field(default=None, init=False, repr=False)
     _tokenizer: Any = field(default=None, init=False, repr=False)
     _sampling_params: Any = field(default=None, init=False, repr=False)
     _translation_prompt: str = field(default="", init=False, repr=False)
@@ -297,8 +306,19 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         if self._llm is None:
             self._init_model()
+        if self.cache_enabled and self.cache_dir and self._cache is None:
+            self._cache = WorkerTranslationCache(
+                cache_dir=self.cache_dir,
+                run_id=self.cache_run_id or "default",
+                max_chars=self.cache_max_chars,
+            )
+            self._cache.load()
 
     def teardown(self) -> None:
+        if self._cache is not None:
+            # Best-effort: dump this worker's touched entries; the driver merges them post-run.
+            self._cache.dump()
+            self._cache = None
         if self._n_processed:
             logger.info("LLMTranslation: processed {} entries", self._n_processed)
         if self._llm is not None:
@@ -397,6 +417,8 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
 
         prompts: list[str] = []
         prompt_owners: list[tuple[int, str]] = []
+        # (task_idx, target_lang) -> cache key, for cacheable misses written back after generate.
+        to_learn: dict[tuple[int, str], str] = {}
 
         for task_idx, task in enumerate(tasks):
             data = task.data
@@ -435,6 +457,19 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 continue
 
             for target_lang in targets:
+                # Cache: short, recurring sources are served from the in-memory warm-start cache
+                # without an LLM call. lookup() also counts the request + records the source text.
+                if self._cache is not None:
+                    key, hit = self._cache.lookup(self.model_id, source_lang, target_lang, text)
+                    if hit is not None:
+                        translations = data.get(self.translations_key) or {}
+                        translations[target_lang] = hit
+                        data[self.translations_key] = translations
+                        set_note(data, self.name, "applied (cache_hit)", self.notes_key)
+                        continue
+                    if key is not None:  # cacheable miss -> translate, then write back below
+                        to_learn[(task_idx, target_lang)] = key
+
                 prompt = self._format_prompt(data, target_lang, source_lang)
                 prompts.append(prompt)
                 prompt_owners.append((task_idx, target_lang))
@@ -460,6 +495,13 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 task.data[self.translations_key] = translations
                 set_note(task.data, self.name, "applied (translated)", self.notes_key)
                 self._n_processed += 1
+
+                # Write a fresh (non-empty) translation back to the per-worker cache so it can be
+                # merged into the canonical cache for future runs.
+                if self._cache is not None and translation:
+                    key = to_learn.get((task_idx, target_lang))
+                    if key:
+                        self._cache.record(key, translation)
 
         logger.debug("LLMTranslation: batch of {} tasks ({} translations)", len(tasks), len(prompts))
         return tasks

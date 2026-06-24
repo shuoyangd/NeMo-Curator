@@ -105,6 +105,7 @@ from nemo_curator.stages.audio.translation import (
     add_bitext_filter_args,
     all_shards_done,
     build_bitext_filter_stages,
+    merge_translation_cache,
 )
 
 
@@ -211,6 +212,34 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--nmt_repetition_penalty", type=float, default=1.0)
     ap.add_argument("--nmt_seed", type=int, default=1234)
 
+    # ----------------------------------------------------------- Translation cache
+    # Lock-free per-worker cache for short, recurring source texts. Each worker keeps an
+    # in-memory cache (warm-started from a canonical file), dumps its touched entries at
+    # teardown, and the driver merges all dumps into the canonical file after the run.
+    ap.add_argument(
+        "--nmt_cache",
+        action="store_true",
+        help="Enable the short-text translation cache (warm start across runs).",
+    )
+    ap.add_argument(
+        "--nmt_cache_dir",
+        type=str,
+        default=None,
+        help="Directory holding the canonical cache + per-worker dumps. Required with --nmt_cache.",
+    )
+    ap.add_argument(
+        "--nmt_cache_max_chars",
+        type=int,
+        default=40,
+        help="Only source texts with <= this many (stripped) characters are cached.",
+    )
+    ap.add_argument(
+        "--nmt_cache_max_entries",
+        type=int,
+        default=0,
+        help="Optional safety cap on canonical cache size (0 = unbounded).",
+    )
+
     # ------------------------------------------------------------------ Executor
     ap.add_argument(
         "--execution_mode",
@@ -242,6 +271,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
+
+    if args.nmt_cache and not args.nmt_cache_dir:
+        raise ValueError("--nmt_cache requires --nmt_cache_dir.")
+    # One run id shared by every worker this run, so their dumps land in a common dir
+    # ({nmt_cache_dir}/dumps/{run_id}/) that the driver merges afterwards.
+    cache_run_id = os.environ.get("SLURM_JOB_ID") or str(int(time.time()))
 
     # Fake (CPU) translator for dry-runs, else the real vLLM stage. Both share the
     # same I/O contract, so the rest of the pipeline is identical either way.
@@ -279,6 +314,10 @@ def main() -> None:
             repetition_penalty=args.nmt_repetition_penalty,
             seed=args.nmt_seed,
             batch_size=args.nmt_batch_size,
+            cache_enabled=args.nmt_cache,
+            cache_dir=args.nmt_cache_dir,
+            cache_run_id=cache_run_id,
+            cache_max_chars=args.nmt_cache_max_chars,
         )
 
     stages = [
@@ -333,6 +372,16 @@ def main() -> None:
     finally:
         if ray_client is not None:
             ray_client.stop()
+
+    # Driver-side cache merge: fold every worker's per-run dump (+ the previous canonical) into one
+    # canonical file. Runs once on the driver/head, after all workers' teardown() dumps exist, and
+    # covers both the pipeline.run() path and the all_shards_done skip path. Never fails the run.
+    if args.nmt_cache and args.nmt_cache_dir:
+        try:
+            n = merge_translation_cache(args.nmt_cache_dir, args.nmt_cache_max_entries)
+            logger.info("NMT cache: merged to {} entries in {}", n, args.nmt_cache_dir)
+        except Exception as exc:  # noqa: BLE001 - cache is best-effort
+            logger.warning("NMT cache merge skipped: {}", exc)
 
     logger.info(
         "Done. Output files (*.jsonl.done) are in: {}",
