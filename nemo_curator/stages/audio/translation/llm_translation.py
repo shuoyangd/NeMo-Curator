@@ -316,8 +316,10 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
 
     def teardown(self) -> None:
         if self._cache is not None:
-            # Best-effort: dump this worker's touched entries; the driver merges them post-run.
-            self._cache.dump()
+            # Entries are appended to the worker's dump file as they're translated (NOT here),
+            # because the Ray Data backend never calls teardown(). This just closes the handle
+            # (best-effort) on backends that do call teardown (Xenna / ray_actor_pool).
+            self._cache.close()
             self._cache = None
         if self._n_processed:
             logger.info("LLMTranslation: processed {} entries", self._n_processed)
