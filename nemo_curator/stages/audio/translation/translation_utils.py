@@ -198,7 +198,19 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
     qe.add_argument("--qe_comet_cutoff", type=float, default=-0.5)
     qe.add_argument("--qe_pymarian_cutoff", type=float, default=0.6)
     qe.add_argument("--qe_pymarian_shard_size", type=int, default=5000)
-    qe.add_argument("--qe_pymarian_args", type=str, default=None)
+    qe.add_argument(
+        "--qe_pymarian_workspace", type=int, default=8000,
+        help="Marian GPU workspace in MB (-w). GPU/cometoid only.",
+    )
+    qe.add_argument(
+        "--qe_pymarian_mini_batch", type=int, default=32,
+        help="Marian GPU mini-batch (--mini-batch): pairs per GPU forward. GPU/cometoid only. "
+             "Benchmark sweet spot ~64-128 (NOT the same as --qe_batch_size, which is the Ray batch).",
+    )
+    qe.add_argument(
+        "--qe_pymarian_args", type=str, default=None,
+        help="Full Marian arg string override; REPLACES the composed -w/--mini-batch/-d args.",
+    )
 
     regex = parser.add_argument_group("bitext filtering: regex cleanup")
     regex.add_argument(
@@ -323,12 +335,21 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
             if model_name.startswith("cometoid"):
                 model_kwargs["shard_size"] = args.qe_pymarian_shard_size
                 if args.qe_pymarian_args:
+                    # Full override: caller supplies the entire Marian arg string.
                     model_kwargs["marian_args"] = args.qe_pymarian_args
                 elif args.qe_cpu:
                     # CPU marian defaults to --cpu-threads 1, which wastes the cores each
                     # actor reserves (qe_cpus). Use them all so the actor isn't single-
                     # threaded (otherwise QE is the pipeline's tail bottleneck).
                     model_kwargs["marian_args"] = f"--cpu-threads {int(args.qe_cpus)} -w 2000"
+                else:
+                    # GPU: compose -w/--mini-batch from CLI so they're tunable (default 32
+                    # mini-batch leaves GPU throughput on the table; ~64-128 is the sweet
+                    # spot). -d 0 because Ray pins one GPU per actor (seen as device 0).
+                    model_kwargs["marian_args"] = (
+                        f"-w {args.qe_pymarian_workspace} "
+                        f"--mini-batch {args.qe_pymarian_mini_batch} -d 0"
+                    )
             gpu = not args.qe_cpu
             qe_resources = Resources(cpus=args.qe_cpus, gpus=1.0) if gpu else Resources(cpus=args.qe_cpus)
             stages.append(
