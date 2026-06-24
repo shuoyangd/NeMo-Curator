@@ -260,12 +260,14 @@ def merge_translation_cache(cache_dir: str, max_entries: int = 0) -> int:
         )
         merged = dict(itertools.islice(merged.items(), max_entries))
 
-    # 4. atomic publish: write temp then rename over canonical
+    # 4. atomic publish: write temp then rename over canonical, ordered by hit_count desc
+    #    (presentation only -- most-requested entries first; does not affect eviction).
     try:
         os.makedirs(cache_dir, exist_ok=True)
         tmp = canonical + ".tmp"
+        ordered = sorted(merged.items(), key=lambda kv: kv[1]["hit_count"], reverse=True)
         with open(tmp, "w", encoding="utf-8") as f:
-            for key, entry in merged.items():
+            for key, entry in ordered:
                 f.write(
                     json.dumps(
                         {"k": key, "src": entry["src"], "tgt": entry["tgt"], "hit_count": entry["hit_count"]},
