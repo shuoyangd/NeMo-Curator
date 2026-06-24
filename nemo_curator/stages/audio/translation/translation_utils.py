@@ -208,8 +208,14 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
              "Benchmark sweet spot ~64-128 (NOT the same as --qe_batch_size, which is the Ray batch).",
     )
     qe.add_argument(
+        "--qe_pymarian_log_level", type=str, default="info",
+        choices=["trace", "debug", "info", "warn", "err", "critical", "off"],
+        help="Marian Evaluator --log-level (cometoid only). Use 'trace'/'debug' to see how far "
+             "init/inference gets before a crash. (Marian has no --debug flag.)",
+    )
+    qe.add_argument(
         "--qe_pymarian_args", type=str, default=None,
-        help="Full Marian arg string override; REPLACES the composed -w/--mini-batch/-d args.",
+        help="Full Marian arg string override; REPLACES the composed -w/--mini-batch/-d/--log-level args.",
     )
 
     regex = parser.add_argument_group("bitext filtering: regex cleanup")
@@ -341,14 +347,19 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
                     # CPU marian defaults to --cpu-threads 1, which wastes the cores each
                     # actor reserves (qe_cpus). Use them all so the actor isn't single-
                     # threaded (otherwise QE is the pipeline's tail bottleneck).
-                    model_kwargs["marian_args"] = f"--cpu-threads {int(args.qe_cpus)} -w 2000"
+                    model_kwargs["marian_args"] = (
+                        f"--cpu-threads {int(args.qe_cpus)} -w 2000 "
+                        f"--log-level {args.qe_pymarian_log_level}"
+                    )
                 else:
                     # GPU: compose -w/--mini-batch from CLI so they're tunable (default 32
                     # mini-batch leaves GPU throughput on the table; ~64-128 is the sweet
                     # spot). -d 0 because Ray pins one GPU per actor (seen as device 0).
+                    # --log-level trace/debug surfaces how far init gets before a segfault.
                     model_kwargs["marian_args"] = (
                         f"-w {args.qe_pymarian_workspace} "
-                        f"--mini-batch {args.qe_pymarian_mini_batch} -d 0"
+                        f"--mini-batch {args.qe_pymarian_mini_batch} -d 0 "
+                        f"--log-level {args.qe_pymarian_log_level}"
                     )
             gpu = not args.qe_cpu
             qe_resources = Resources(cpus=args.qe_cpus, gpus=1.0) if gpu else Resources(cpus=args.qe_cpus)
