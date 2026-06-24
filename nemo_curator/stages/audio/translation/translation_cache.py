@@ -19,16 +19,20 @@ boilerplate). Re-translating identical short sources wastes GPU. A previous atte
 shared SQLite (``diskcache``) consulted by every worker; on Lustre its writer lock serialized all
 workers and killed parallelism. This module avoids any shared store **during** the run:
 
-* Each worker keeps the canonical cache in an **in-memory** dict (warm start; served lock-free).
-* Each time a worker **translates** a short source (a cache miss), it **appends** that entry to its
-  **own** dump file -- no two writers ever touch the same file, and there is no per-``get`` write.
+* Each worker keeps the canonical cache in an **in-memory** dict (warm start; served lock-free) and
+  counts every key access in memory.
+* Each worker periodically **flushes a snapshot** of its entries (``{key: src, translation, count}``)
+  to its **own** dump file -- no two writers ever touch the same file, and the snapshot is rewritten
+  (not appended), so hot keys cost O(distinct keys), not O(accesses).
 * The driver, after the pipeline finishes, calls :func:`merge_translation_cache` to fold all
-  per-worker dumps + the previous canonical into one canonical file, written atomically.
+  per-worker snapshots + the previous canonical into one canonical file, written atomically,
+  **summing** the access counts.
 
-Why append-on-translate instead of dump-at-teardown: the Ray Data backend never calls a stage's
+Why flush-during-run instead of dump-at-teardown: the Ray Data backend never calls a stage's
 ``teardown()`` (it has no such hook), and the job overlay does not sync ``backends/`` -- so the cache
-must persist itself from inside the stage's own code path, not a lifecycle hook. Appending as each
-miss is translated is executor-agnostic (works under ray_data, Xenna, ray_actor_pool alike).
+must persist itself from inside the stage's own ``process_batch`` path, not a lifecycle hook. A
+periodic snapshot flush is executor-agnostic (works under ray_data, Xenna, ray_actor_pool alike);
+worst case a hard kill loses only the counts since the last flush.
 
 Value / limitation: this gives a **cross-run warm start** for common short phrases, plus intra-run
 reuse within a single worker (``record`` updates the in-memory dict). There is no cross-worker
@@ -39,14 +43,12 @@ Cache key: ``sha256(model_id | src_lang | tgt_lang | text)`` -- the target langu
 the translation differs per target, and the source language captures direction. With a fixed
 seed/prompt the translation is deterministic, so model + langs + source text is enough.
 
-Entry format (JSONL):
+Entry format (JSONL), identical for canonical and per-worker dumps:
+``{"k": <hash>, "src": <source text>, "tgt": <translation>, "hit_count": <access count>}``
 
-* canonical line: ``{"k": <hash>, "src": <source text>, "v": <translation>, "n": <times translated>}``
-* per-worker dump line: ``{"k": <hash>, "src": <source text>, "v": <translation>}`` -- one line per
-  translation event; merge counts the lines per key to get ``n``.
-
-``n`` is an **informational** counter (how many times that hash was actually translated, summed
-across all workers and runs); it is NOT used to evict (no LFU).
+``hit_count`` counts **how many times the key was requested** (every cacheable lookup -- the dominant
+term is cache hits, plus the one initial miss that populated it). It is **informational** -- NOT an
+eviction key (no LFU).
 """
 
 from __future__ import annotations
@@ -58,13 +60,13 @@ import json
 import os
 import shutil
 import socket
-from typing import TextIO
 
 from loguru import logger
 
 CANONICAL_FILENAME = "canonical.jsonl"
 DUMPS_DIRNAME = "dumps"
 _KEY_SEP = "\x1f"  # unit separator -- unlikely to appear in model ids / language names / text
+_DEFAULT_FLUSH_EVERY = 50  # flush the snapshot every N process_batch calls
 
 
 def cache_key(model_id: str, src_lang: str, tgt_lang: str, text: str) -> str:
@@ -89,24 +91,33 @@ def dump_path(cache_dir: str, run_id: str, host: str, pid: int) -> str:
 
 
 class WorkerTranslationCache:
-    """Per-worker, in-memory translation cache that persists itself incrementally.
+    """Per-worker, in-memory translation cache that snapshots itself periodically.
 
     Built in ``LLMTranslationStage.setup()``. Loads the canonical cache as a warm start, serves
-    lookups from memory, and appends each freshly-translated short entry to this worker's own dump
-    file as it is produced (no reliance on ``teardown()``). The driver merges all dumps afterwards.
+    lookups from memory (counting each access), and flushes a snapshot of its entries to this
+    worker's own dump file every ``flush_every`` batches (no reliance on ``teardown()``). The driver
+    merges all snapshots afterwards, summing the access counts.
     """
 
-    def __init__(self, cache_dir: str, run_id: str, max_chars: int = 40) -> None:
+    def __init__(
+        self, cache_dir: str, run_id: str, max_chars: int = 40, flush_every: int = _DEFAULT_FLUSH_EVERY
+    ) -> None:
         self.cache_dir = cache_dir
         self.run_id = run_id
         self.max_chars = max_chars
-        self._entries: dict[str, str] = {}  # warm start + entries learned this run: key -> translation
-        self._src: dict[str, str] = {}  # key -> source text (stashed at lookup, used when recording)
-        self._fh: TextIO | None = None  # lazily-opened, line-buffered dump file handle
+        self.flush_every = max(1, flush_every)
+        self._val: dict[str, str] = {}  # key -> translation (warm start + learned this run)
+        self._src: dict[str, str] = {}  # key -> source text
+        self._count: dict[str, int] = {}  # key -> times requested THIS run (this worker)
+        self._since_flush = 0
 
     # ------------------------------------------------------------------ load
     def load(self) -> None:
-        """Read the canonical cache into memory. Fail open (empty cache) on any error."""
+        """Read the canonical cache into memory (values only). Fail open on any error.
+
+        Counts are NOT carried into ``_count`` -- ``_count`` holds only this run's accesses, which the
+        merge adds to the canonical's running total. Loading counts here would double-count them.
+        """
         path = canonical_path(self.cache_dir)
         try:
             if not os.path.exists(path):
@@ -118,11 +129,12 @@ class WorkerTranslationCache:
                     if not line:
                         continue
                     entry = json.loads(line)
-                    self._entries[entry["k"]] = entry["v"]
-            logger.info("TranslationCache: loaded {} entries from {}", len(self._entries), path)
+                    self._val[entry["k"]] = entry["tgt"]
+                    self._src[entry["k"]] = entry.get("src", "")
+            logger.info("TranslationCache: loaded {} entries from {}", len(self._val), path)
         except Exception as exc:  # noqa: BLE001 - cache is best-effort; never block the run
             logger.warning("TranslationCache: failed to load {}: {}; starting empty", path, exc)
-            self._entries = {}
+            self._val, self._src = {}, {}
 
     # ---------------------------------------------------------------- lookup
     def is_cacheable(self, text: str) -> bool:
@@ -131,78 +143,76 @@ class WorkerTranslationCache:
     def lookup(
         self, model_id: str, src_lang: str, tgt_lang: str, text: str
     ) -> tuple[str | None, str | None]:
-        """Return ``(key, value)``.
+        """Return ``(key, value)`` and **count this access**.
 
-        ``(None, None)`` -> not cacheable (caller translates normally, no bookkeeping).
+        ``(None, None)`` -> not cacheable (caller translates normally, not counted).
         ``(key, value)`` -> cache hit (use ``value``, skip the LLM).
         ``(key, None)`` -> cacheable miss (caller translates, then calls :meth:`record`).
-
-        Stashes the source text so :meth:`record` can write it without re-threading it through.
         """
         if not self.is_cacheable(text):
             return None, None
         key = cache_key(model_id, src_lang, tgt_lang, text)
+        self._count[key] = self._count.get(key, 0) + 1  # every request (hit or the first miss)
         self._src[key] = text
-        return key, self._entries.get(key)
+        return key, self._val.get(key)
 
     def record(self, key: str, translation: str) -> None:
-        """Persist a freshly-translated (miss) result.
+        """Store a freshly-translated (miss) result so later occurrences hit and it gets persisted."""
+        if key and translation:
+            self._val[key] = translation
 
-        Appends one line to this worker's dump file (one line == one translation event, so the merge
-        counts lines to get ``n``) and updates the in-memory dict so later occurrences on this worker
-        hit instead of re-translating. Best-effort: a write failure only costs a cache entry.
-        """
-        if not key or not translation:
+    def maybe_flush(self) -> None:
+        """Call once per ``process_batch``; flushes a snapshot every ``flush_every`` batches."""
+        self._since_flush += 1
+        if self._since_flush >= self.flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        """Atomically (re)write this worker's full snapshot of counted entries. Best-effort."""
+        self._since_flush = 0
+        if not self._count:
             return
+        path = dump_path(self.cache_dir, self.run_id, socket.gethostname(), os.getpid())
         try:
-            fh = self._ensure_open()
-            if fh is not None:
-                fh.write(
-                    json.dumps(
-                        {"k": key, "src": self._src.get(key, ""), "v": translation},
-                        ensure_ascii=False,
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.tmp"
+            written = 0
+            with open(tmp, "w", encoding="utf-8") as f:
+                for key, count in self._count.items():
+                    value = self._val.get(key)
+                    if not value:  # accessed but never got a (non-empty) translation -> skip
+                        continue
+                    f.write(
+                        json.dumps(
+                            {"k": key, "src": self._src.get(key, ""), "tgt": value, "hit_count": count},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
+                    written += 1
+            os.replace(tmp, path)  # atomic: a reader/crash never sees a half-written snapshot
+            logger.debug("TranslationCache: flushed {} entries to {}", written, path)
         except Exception as exc:  # noqa: BLE001 - best-effort; keep translating
-            logger.warning("TranslationCache: failed to append entry: {}", exc)
-        # Update the in-memory dict regardless, so same-worker repeats hit this run.
-        self._entries[key] = translation
+            logger.warning("TranslationCache: failed to flush snapshot to {}: {}", path, exc)
 
     def close(self) -> None:
-        """Close the dump file handle if open (best-effort; data is already line-flushed)."""
-        if self._fh is not None:
-            try:
-                self._fh.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._fh = None
-
-    # ------------------------------------------------------------------ internal
-    def _ensure_open(self) -> TextIO | None:
-        if self._fh is None:
-            path = dump_path(self.cache_dir, self.run_id, socket.gethostname(), os.getpid())
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            # Line-buffered so each entry is flushed as it is written (survives an actor that is
-            # killed without teardown). Append mode in case the same worker reopens within a run.
-            self._fh = open(path, "a", buffering=1, encoding="utf-8")
-            logger.info("TranslationCache: appending learned entries to {}", path)
-        return self._fh
+        """Final flush (for backends that call teardown; ray_data relies on maybe_flush)."""
+        self.flush()
 
 
 def merge_translation_cache(cache_dir: str, max_entries: int = 0) -> int:
-    """Fold all per-worker dumps + the previous canonical into one canonical file.
+    """Fold all per-worker snapshots + the previous canonical into one canonical file.
 
     Single-process, run by the driver after the pipeline finishes -- no locks, since every worker
-    has already written its own file. Unions keys (deduped by hash) and **counts dump lines** into
-    the occurrence counter ``n`` (one dump line == one translation event), writes the result
-    atomically, and deletes the consumed dump dirs. Returns the number of entries in the merged
-    canonical. Never raises -- all errors are logged.
+    has already written its own snapshot. Unions keys (deduped by hash) and **sums** the access
+    counter ``n`` across the previous canonical and every worker snapshot, writes the result
+    atomically, and deletes the consumed dump dirs. Returns the number of merged entries. Never
+    raises -- all errors are logged.
     """
     canonical = canonical_path(cache_dir)
     merged: dict[str, dict] = {}
 
-    # 1. previous canonical first (carries the running counter; its src/v win on collision)
+    # 1. previous canonical first (carries the running count; its src/v win on collision)
     try:
         if os.path.exists(canonical):
             with open(canonical, encoding="utf-8") as f:
@@ -213,13 +223,13 @@ def merge_translation_cache(cache_dir: str, max_entries: int = 0) -> int:
                     entry = json.loads(line)
                     merged[entry["k"]] = {
                         "src": entry.get("src", ""),
-                        "v": entry["v"],
-                        "n": int(entry.get("n", 0)),
+                        "tgt": entry["tgt"],
+                        "hit_count": int(entry.get("hit_count", 0)),
                     }
     except Exception as exc:  # noqa: BLE001
         logger.warning("TranslationCache.merge: failed to read {}: {}", canonical, exc)
 
-    # 2. fold in every per-worker dump (this run + any leftover prior runs); +1 to n per line
+    # 2. fold in every per-worker snapshot (this run + any leftover prior runs); sum the counts
     dump_files = sorted(glob.glob(os.path.join(cache_dir, DUMPS_DIRNAME, "*", "*.jsonl")))
     consumed_dirs: set[str] = set()
     for path in dump_files:
@@ -232,11 +242,12 @@ def merge_translation_cache(cache_dir: str, max_entries: int = 0) -> int:
                         continue
                     entry = json.loads(line)
                     key = entry["k"]
+                    count = int(entry.get("hit_count", 0))
                     if key in merged:
-                        merged[key]["n"] += 1
+                        merged[key]["hit_count"] += count
                     else:
-                        merged[key] = {"src": entry.get("src", ""), "v": entry["v"], "n": 1}
-        except Exception as exc:  # noqa: BLE001 - skip a corrupt dump, keep the rest
+                        merged[key] = {"src": entry.get("src", ""), "tgt": entry["tgt"], "hit_count": count}
+        except Exception as exc:  # noqa: BLE001 - skip a corrupt snapshot, keep the rest
             logger.warning("TranslationCache.merge: skipping bad dump {}: {}", path, exc)
 
     # 3. optional crude safety cap (insertion order; the counter is NOT an eviction key)
@@ -257,7 +268,7 @@ def merge_translation_cache(cache_dir: str, max_entries: int = 0) -> int:
             for key, entry in merged.items():
                 f.write(
                     json.dumps(
-                        {"k": key, "src": entry["src"], "v": entry["v"], "n": entry["n"]},
+                        {"k": key, "src": entry["src"], "tgt": entry["tgt"], "hit_count": entry["hit_count"]},
                         ensure_ascii=False,
                     )
                     + "\n"

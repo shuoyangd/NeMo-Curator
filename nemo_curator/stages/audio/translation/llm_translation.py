@@ -505,5 +505,10 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                     if key:
                         self._cache.record(key, translation)
 
+        # Persist the cache periodically from inside process_batch (the Ray Data backend never
+        # calls teardown()), flushing this worker's snapshot every flush_every batches.
+        if self._cache is not None:
+            self._cache.maybe_flush()
+
         logger.debug("LLMTranslation: batch of {} tasks ({} translations)", len(tasks), len(prompts))
         return tasks
