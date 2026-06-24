@@ -64,6 +64,13 @@ class TranslationCache:
     SQLite databases, so distinct keys never contend; and a short ``timeout`` makes
     the rare same-shard collision fail open to a miss (caught below) instead of
     blocking a GPU actor for the 60 s diskcache default.
+
+    Networked filesystems (Lustre/NFS): diskcache defaults to ``journal_mode=wal``,
+    which **does not work on Lustre/NFS** — WAL needs a shared-memory ``-shm`` mmap
+    and locking those filesystems don't provide, so SQLite ops hang. We therefore
+    force ``journal_mode=delete`` (rollback journal + POSIX locks, networked-FS safe)
+    and disable the SQLite mmap. For best performance put ``cache_dir`` on node-local
+    disk; on Lustre it still requires the mount to honor file locks (``-o flock``).
     """
 
     cache_dir: str
@@ -73,6 +80,7 @@ class TranslationCache:
     eviction_policy: str = "least-frequently-used"
     shards: int = 8                  # SQLite DBs per pair; spreads the writer lock
     timeout: float = 0.1             # s; contended op fails open (miss/no-op) vs blocking the GPU
+    journal_mode: str = "delete"     # NOT wal: wal hangs on Lustre/NFS (needs -shm mmap)
 
     _ok: bool = field(default=False, init=False, repr=False)
     _caches: dict[tuple[str, str], "FanoutCache"] = field(default_factory=dict, init=False, repr=False)
@@ -112,6 +120,8 @@ class TranslationCache:
                 timeout=self.timeout,
                 size_limit=limit,
                 eviction_policy=self.eviction_policy,
+                sqlite_journal_mode=self.journal_mode,  # delete, not wal (Lustre/NFS safe)
+                sqlite_mmap_size=0,                      # mmap also unreliable on networked FS
             )
             self._caches[pair] = cache
         return cache
