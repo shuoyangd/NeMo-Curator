@@ -203,11 +203,15 @@ class WorkerTranslationCache:
 def merge_translation_cache(cache_dir: str, max_entries: int = 0) -> int:
     """Fold all per-worker snapshots + the previous canonical into one canonical file.
 
-    Single-process, run by the driver after the pipeline finishes -- no locks, since every worker
-    has already written its own snapshot. Unions keys (deduped by hash) and **sums** the access
-    counter ``n`` across the previous canonical and every worker snapshot, writes the result
-    atomically, and deletes the consumed dump dirs. Returns the number of merged entries. Never
-    raises -- all errors are logged.
+    Single-process, run by the driver after the pipeline finishes. Unions keys (deduped by hash) and
+    **sums** the access counter ``n`` across the previous canonical and every worker snapshot, writes
+    the result atomically, and deletes the consumed dump dirs. Returns the number of merged entries.
+    Never raises -- all errors are logged.
+
+    NOTE: with a shared/global cache_dir, concurrent jobs merging at the same instant can race on the
+    read-modify-write of ``canonical.jsonl`` (last writer wins; the atomic rename keeps the file
+    valid, a few entries may be dropped and re-translated next run). This is accepted as low-risk —
+    lang-groups have disjoint keys and jobs finish at staggered times.
     """
     canonical = canonical_path(cache_dir)
     merged: dict[str, dict] = {}

@@ -602,35 +602,36 @@ class AudioTaskRegexModifier(ProcessingStage[AudioTask, AudioTask]):
 class FinalizeTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     """Finalize each row's translation fields for output.
 
-    Each upstream stage already cleans up after itself (markers record their score
-    in ``additional_notes`` and leave no temporary column; QE writes the surfaced
-    ``translation_quality_score`` directly; the expander strips its scratch keys),
-    so the output is just the input fields + the translation fields and this stage
-    only normalizes, **driven by the ``translation_skipme`` reason string**, three
-    cases:
+    The internal working flag ``translation_skipme`` is **removed** here (popped) so it never reaches
+    the output. Driven by its reason string, three cases — each also recording a note under this
+    stage's name in ``additional_notes``:
 
-    - empty source (reason ``"empty_source"``, set by the LLM): empty ``translation``
-      + ``translation_raw``, ``translation_quality_score = 1``, and the working flag
-      is reset to ``""`` (empty source is not a skip in the output — the sentinel
-      quality 1 marks it);
+    - empty source (reason ``"empty_source"``, set by the LLM): kept distinct from a quality
+      rejection — empty ``translation`` + ``translation_raw``, ``translation_quality_score = 1``,
+      note ``"empty_source"``;
     - filtered (any other reason — a filter name or an input ``_skipme`` reason):
-      empty ``translation`` but KEEP ``translation_raw`` (the verbatim LLM output, so
-      the rejected text stays auditable), ``translation_quality_score = None``;
-    - kept (reason ``""``): ``translation_quality_score`` = the QE score already
-      written by the QE stage (``None`` when QE is off / didn't run).
+      ``translation_quality_score = min_quality_score`` (-1.0, so rejected rows sort worst); the
+      ``translation`` is KEPT (the verbatim LLM output stays auditable), and the reason that was in
+      ``translation_skipme`` is moved into the note (``"skipped: <reason>"``);
+    - kept (reason ``""``): ``translation_quality_score`` = the QE score already surfaced by the QE
+      stage (``None`` when QE is off / didn't run), note ``"kept (quality=<score>)"``.
+
+    Finally, for every row, if ``translation`` is empty it falls back to ``translation_raw``.
     """
 
     translation_key: str = "translation"
     translation_raw_key: str = "translation_raw"
     quality_key: str = "translation_quality_score"
     skip_key: str = WORK_SKIP_KEY
+    notes_key: str = NOTES_KEY
+    min_quality_score: float = -1.0  # score for filter-rejected rows (sorts below cometoid's 0..1)
     name: str = "FinalizeTranslation"
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.translation_key, self.translation_raw_key, self.quality_key]
+        return [], [self.translation_key, self.translation_raw_key, self.quality_key, self.notes_key]
 
     def process(self, task: AudioTask) -> AudioTask:
         return self.process_batch([task])[0]
@@ -638,24 +639,27 @@ class FinalizeTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
         for task in tasks:
             data = task.data
-            reason = data.get(self.skip_key) or ""
+            reason = data.pop(self.skip_key, "") or ""  # drop translation_skipme from the output
             if reason == EMPTY_SOURCE_REASON:
-                # Empty source — expected empty translation, not a quality rejection.
-                # Reset the working flag to "" (empty source is NOT a skip in the
-                # output); the sentinel quality 1 marks the case.
+                # Empty source — expected empty translation, NOT a quality rejection. Keep its
+                # distinct sentinel quality 1 so it's separable from filter-rejected rows.
                 data[self.translation_key] = ""
                 data[self.translation_raw_key] = ""
                 data[self.quality_key] = 1
-                data[self.skip_key] = ""
+                set_note(data, self.name, "empty_source", self.notes_key)
             elif reason:
-                # Filtered (a filter name, or an input _skipme reason): empty the final
-                # translation but KEEP translation_raw (the verbatim LLM output) so the
-                # rejected text stays auditable.
-                data[self.translation_key] = ""
-                data[self.quality_key] = None
+                # Filtered: keep the verbatim translation, mark worst quality, note the reason
+                # (moved out of translation_skipme).
+                data[self.quality_key] = self.min_quality_score
+                set_note(data, self.name, f"skipped: {reason}", self.notes_key)
             else:
                 # Kept: keep the QE score the QE stage surfaced, else None.
-                data.setdefault(self.quality_key, None)
+                quality = data.setdefault(self.quality_key, None)
+                set_note(data, self.name, f"kept (quality={quality})", self.notes_key)
+
+            # Never emit an empty translation when a verbatim one exists.
+            if not data.get(self.translation_key):
+                data[self.translation_key] = data.get(self.translation_raw_key, "")
         return tasks
 
 
