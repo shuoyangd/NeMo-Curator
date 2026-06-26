@@ -71,7 +71,7 @@ class FakeLLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     """
 
     name: str = "LLMTranslation"  # keep the real name so additional_notes/output match
-    text_key: str = "pnc_text"
+    text_key: str = "tn_raw"
     source_lang_key: str = SOURCE_LANG_NAME_KEY
     target_lang_key: str = TRANSLATE_TO_KEY
     translations_key: str = TRANSLATIONS_KEY

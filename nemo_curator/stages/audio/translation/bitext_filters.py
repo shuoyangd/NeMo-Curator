@@ -158,6 +158,21 @@ def _add_note(task: AudioTask, stage_name: str, detail: str, notes_key: str = NO
     set_note(task.data, stage_name, detail, notes_key)
 
 
+def _sanitize_qe_field(text: object) -> str:
+    """Make one field safe for the cometoid/pymarian QE input (NON-mutating helper).
+
+    Marian reads one tab-separated line per pair with ``#fields == #vocabs`` (2 for comet-qe QE)
+    and length-filters empty sentences. So a ``\\t`` in the text adds a column (-> hard SIGABRT
+    ``Number of fields does not match number of vocabs``), and an **empty** field makes Marian
+    return fewer scores than inputs (-> ``assert len(scores) == len(batch)`` in pymarian). Collapse
+    whitespace runs (tabs/newlines -> space) and replace an empty field with ``"."``.
+
+    This is applied ONLY to the throwaway strings handed to the QE model — it never rewrites the
+    row's stored ``translation``/source fields. Verified locally against ``marian-nmt/cometoid22-wmt23``.
+    """
+    return " ".join(str(text or "").split()) or "."
+
+
 class CharCountFilter:
     """Length filter counting Unicode characters (CJK-safe; no word splitter).
 
@@ -465,7 +480,7 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
     cutoff: float
     mode: str = "always_en_x"
     gpu: bool = True
-    src_key: str = "pnc_text"
+    src_key: str = "tn_raw"
     tgt_key: str = "translation"
     src_lang_key: str = "source_lang"
     tgt_lang_key: str = "target_lang"
@@ -478,6 +493,9 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
     num_workers_override: int | None = None
     model_kwargs: dict[str, Any] = field(default_factory=dict)
     model: Any = None
+    # Set in setup(): cometoid/pymarian needs its TSV input sanitized (empty/tab guards);
+    # comet-qe (torch) does not, so we gate the sanitizer on the loaded model type.
+    _is_pymarian: bool = field(default=False, init=False, repr=False)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], [self.src_key, self.tgt_key, self.src_lang_key, self.tgt_lang_key]
@@ -501,10 +519,12 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
         return spec
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
-        from nemo_curator.stages.text.filters.qe import QualityEstimationFilter
+        from nemo_curator.stages.text.filters.qe import PyMarianQEModel, QualityEstimationFilter
 
         model_cls = QualityEstimationFilter.SUPPORTED_MODELS[self.model_name]
         self.model = model_cls.load_model(self.model_name, gpu=self.gpu, **self.model_kwargs)
+        # cometoid/pymarian aborts on tabs and asserts on empty fields; sanitize its input.
+        self._is_pymarian = isinstance(self.model, PyMarianQEModel)
 
     def process(self, task: AudioTask) -> AudioTask:
         return self.process_batch([task])[0]
@@ -534,8 +554,13 @@ class AudioTaskQEMarker(ProcessingStage[AudioTask, AudioTask]):
         return tasks
 
     def _score(self, pending: list[AudioTask]) -> list[float]:
-        srcs = [str(task.data.get(self.src_key, "") or "") for task in pending]
-        tgts = [str(task.data.get(self.tgt_key, "") or "") for task in pending]
+        # Build the model inputs as LOCAL copies — never mutate task.data here. For
+        # cometoid/pymarian, sanitize each field (collapse tabs/newlines, "." for empties) so the
+        # evaluator doesn't SIGABRT on tabs or desync its score count on empty fields. comet-qe
+        # (torch) handles those itself, so it gets the raw fields.
+        prep = _sanitize_qe_field if self._is_pymarian else (lambda t: str(t or ""))
+        srcs = [prep(task.data.get(self.src_key, "")) for task in pending]
+        tgts = [prep(task.data.get(self.tgt_key, "")) for task in pending]
 
         if self.mode == "simple":
             inputs = [self.model.wrap_qe_input(src, tgt) for src, tgt in zip(srcs, tgts, strict=True)]

@@ -178,7 +178,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     spg.add_argument("--nmt_system_prompt", type=str, default=None)
     spg.add_argument("--nmt_system_prompt_file", type=str, default=None)
 
-    ap.add_argument("--text_key", type=str, default="pnc_text", help="Manifest key for source text.")
+    ap.add_argument("--text_key", type=str, default="tn_raw", help="Manifest key for source text.")
     ap.add_argument(
         "--skip_me_key",
         type=str,
