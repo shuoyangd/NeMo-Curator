@@ -363,6 +363,16 @@ def main() -> None:
                 # RayDataExecutor connects to the cluster SlurmRayClient bootstrapped
                 # (via RAY_ADDRESS) and ignores execution_mode — Ray Data manages its
                 # own streaming scheduling and backpressure.
+                #
+                # preserve_order=True makes outputs flow in input (manifest) order: each
+                # manifest's rows reach the directional writer together, so its .done fires
+                # before the next manifest's rows arrive. That gives incremental, durable
+                # per-manifest progress under the Slurm time limit (a partial run leaves
+                # earlier manifests .done instead of all-partial), without reloading the
+                # vLLM engine per manifest. Bounded by backpressure; costs some reorder
+                # freedom. (No effect under --executor xenna.)
+                from ray.data import DataContext
+                DataContext.get_current().execution_options.preserve_order = True
                 executor = RayDataExecutor()
             else:
                 executor = XennaExecutor(config={"execution_mode": args.execution_mode})
