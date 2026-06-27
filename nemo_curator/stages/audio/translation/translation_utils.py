@@ -82,11 +82,13 @@ def handle_key(shard_key: str, direction: str) -> str:
 def output_paths(output_dir: str, shard_key: str, direction: str) -> tuple[str, str]:
     """Return the ``(jsonl_path, done_path)`` pair for one (shard, direction).
 
-    Files are nested under a per-direction folder:
-    ``{output_dir}/{direction}/{shard_key}_{direction}.jsonl[.done]`` (e.g.
-    ``.../en-de/m1_en-de.jsonl``). Any ``shard_key`` subdirectories nest underneath.
+    Layout: ``{output_dir}/{shard_subdirs}/{direction}/{stem}_{direction}.jsonl[.done]`` — the input
+    tree is mirrored, with a per-direction folder placed right above the file (e.g.
+    ``.../europarl/en/en-de/m1_en-de.jsonl``). When the shard has no subdirs it's just
+    ``{output_dir}/{direction}/{stem}_{direction}.jsonl``.
     """
-    jsonl = os.path.join(output_dir, direction, f"{handle_key(shard_key, direction)}{JSONL_EXT}")
+    subdirs, stem = os.path.split(shard_key)
+    jsonl = os.path.join(output_dir, subdirs, direction, f"{handle_key(stem, direction)}{JSONL_EXT}")
     return jsonl, jsonl + ".done"
 
 
@@ -107,18 +109,25 @@ def parse_handle_key(relpath_no_ext: str) -> tuple[str, str] | None:
 def parse_output_relpath(relpath_no_ext: str) -> tuple[str, str] | None:
     """Parse an on-disk output relpath (sans extension) into ``(shard_key, direction)``.
 
-    Inverse of :func:`output_paths`' layout ``"{direction}/{shard_key}_{direction}"``:
-    strip the leading ``{direction}/`` folder, parse the remaining handle key, and verify
-    the parsed direction matches the folder. Returns ``None`` for anything that doesn't
-    match (e.g. an old flat-layout file with no leading direction folder).
+    Inverse of :func:`output_paths`' layout ``"{shard_subdirs}/{direction}/{stem}_{direction}"``:
+    the filename gives ``(stem, direction)``; the folder directly above it must equal that
+    ``direction``; everything above that folder is the shard's subdirs. Returns ``None`` for
+    anything that doesn't match (e.g. an old flat-layout file with no direction folder).
     """
-    dir_part, sep, rest = relpath_no_ext.partition(os.sep)
+    head, sep, filename = relpath_no_ext.rpartition(os.sep)
     if not sep:
+        return None  # need at least "{direction}/{stem}_{direction}"
+    parsed = parse_handle_key(filename)
+    if parsed is None:
         return None
-    parsed = parse_handle_key(rest)
-    if parsed is None or parsed[1] != dir_part:
+    stem, direction = parsed
+    subdirs, sep2, dir_folder = head.rpartition(os.sep)
+    if not sep2:  # head is just the direction folder, no subdirs
+        subdirs, dir_folder = "", head
+    if dir_folder != direction:
         return None
-    return parsed
+    shard_key = os.path.join(subdirs, stem) if subdirs else stem
+    return shard_key, direction
 
 
 # ----------------------------------------------------------------------------
