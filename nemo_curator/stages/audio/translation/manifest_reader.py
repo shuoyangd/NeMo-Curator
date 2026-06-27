@@ -55,6 +55,7 @@ from loguru import logger
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.audio.translation.language_map import LANGUAGE_MAP, _normalize_code, lang_code_to_name
 from nemo_curator.stages.audio.translation.translation_utils import (
+    LOW_QUALITY_REASON,
     SOURCE_LANG_CODE_KEY,
     SOURCE_LANG_NAME_KEY,
     TRANSLATE_TO_KEY,
@@ -149,6 +150,21 @@ def _relative_shard_key(manifest_path: str, input_root: str | None) -> str:
     return Path(manifest_path).stem
 
 
+def _is_low_quality(val: object) -> bool:
+    """True only when an input ``high_quality`` value is explicitly false-y.
+
+    Missing / True / anything unrecognised -> keep (not low quality). Accepts bool,
+    0/0.0, and the strings ``"false"``/``"0"``/``"no"`` (case-insensitive).
+    """
+    if isinstance(val, bool):
+        return not val
+    if isinstance(val, (int, float)):
+        return val == 0
+    if isinstance(val, str):
+        return val.strip().lower() in ("false", "0", "no")
+    return False
+
+
 def all_shards_done(manifest_path: str | list[str], output_dir: str) -> bool:
     """Conservative pre-flight check used to skip ``pipeline.run()`` entirely.
 
@@ -233,6 +249,7 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     source_lang_name_key: str = SOURCE_LANG_NAME_KEY
     translate_to_key: str = TRANSLATE_TO_KEY
     input_skip_key: str = "_skipme"
+    high_quality_key: str = "high_quality"
     input_root: str | None = None
 
     _target_codes_norm: list[str] = field(default_factory=list, init=False, repr=False)
@@ -320,6 +337,11 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 # own reason on the first rejection (first reason wins).
                 original_skip = row.get(self.input_skip_key)
                 row[TRANSLATION_SKIP_KEY] = str(original_skip) if original_skip else ""
+                # A false-y input ``high_quality`` flags the row as low quality: skip it (no
+                # translation) with a distinct reason so finalize gives it the minimum QE score
+                # and a "skipped: low_quality" note. Only fills an empty gate (input _skipme wins).
+                if not row[TRANSLATION_SKIP_KEY] and _is_low_quality(row.get(self.high_quality_key)):
+                    row[TRANSLATION_SKIP_KEY] = LOW_QUALITY_REASON
                 row[self.translate_to_key] = target_names
 
                 for tgt_norm in self._row_targets(src_norm):
@@ -441,6 +463,7 @@ class TranslationManifestReader(CompositeStage[_EmptyTask, AudioTask]):
     source_lang_name_key: str = SOURCE_LANG_NAME_KEY
     translate_to_key: str = TRANSLATE_TO_KEY
     input_skip_key: str = "_skipme"
+    high_quality_key: str = "high_quality"
     files_per_partition: int | None = 1
     file_extensions: list[str] | None = None
     storage_options: dict[str, Any] | None = None
@@ -472,6 +495,7 @@ class TranslationManifestReader(CompositeStage[_EmptyTask, AudioTask]):
                 source_lang_name_key=self.source_lang_name_key,
                 translate_to_key=self.translate_to_key,
                 input_skip_key=self.input_skip_key,
+                high_quality_key=self.high_quality_key,
                 input_root=_derive_input_root(self.manifest_path),
             ),
         ]

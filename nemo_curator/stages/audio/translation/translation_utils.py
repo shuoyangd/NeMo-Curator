@@ -61,6 +61,11 @@ TRANSLATION_SKIP_KEY = "translation_skipme"
 # maps it to the empty-source sentinel instead of the filtered outcome.
 EMPTY_SOURCE_REASON = "empty_source"
 
+# Reserved ``translation_skipme`` reason set by the reader when an input row's
+# ``high_quality`` field is false: skip the row (no translation) and let
+# FinalizeTranslationStage map it to the filtered outcome (min quality score + note).
+LOW_QUALITY_REASON = "low_quality"
+
 # Internal scratch keys (never appear in the output manifest).
 SOURCE_LANG_NAME_KEY = "source_lang_name"
 TRANSLATE_TO_KEY = "translate_to"

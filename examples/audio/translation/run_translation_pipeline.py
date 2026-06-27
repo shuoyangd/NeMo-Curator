@@ -188,6 +188,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "the row is kept but receives an empty translation instead of being sent to the LLM."
         ),
     )
+    ap.add_argument(
+        "--high_quality_key",
+        type=str,
+        default="high_quality",
+        help=(
+            "Manifest key marking row quality. When explicitly false (false/0/no), the row is "
+            "skipped (no translation), noted as low quality, and gets the minimum quality score."
+        ),
+    )
 
     # vLLM params
     ap.add_argument("--nmt_tensor_parallel_size", type=int, default=None)
@@ -327,6 +336,7 @@ def main() -> None:
             target_lang_codes=args.target_langs,
             source_lang_key=args.source_lang_code_key,
             input_skip_key=args.skip_me_key,
+            high_quality_key=args.high_quality_key,
         ),
         translate_stage,
         TranslationExpanderStage(
