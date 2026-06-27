@@ -80,22 +80,45 @@ def handle_key(shard_key: str, direction: str) -> str:
 
 
 def output_paths(output_dir: str, shard_key: str, direction: str) -> tuple[str, str]:
-    """Return the ``(jsonl_path, done_path)`` pair for one (shard, direction)."""
-    jsonl = os.path.join(output_dir, f"{handle_key(shard_key, direction)}{JSONL_EXT}")
+    """Return the ``(jsonl_path, done_path)`` pair for one (shard, direction).
+
+    Files are nested under a per-direction folder:
+    ``{output_dir}/{direction}/{shard_key}_{direction}.jsonl[.done]`` (e.g.
+    ``.../en-de/m1_en-de.jsonl``). Any ``shard_key`` subdirectories nest underneath.
+    """
+    jsonl = os.path.join(output_dir, direction, f"{handle_key(shard_key, direction)}{JSONL_EXT}")
     return jsonl, jsonl + ".done"
 
 
 def parse_handle_key(relpath_no_ext: str) -> tuple[str, str] | None:
-    """Split a ``"{shard_key}_{src}-{tgt}"`` relative key into its parts.
+    """Split a ``"{shard_key}_{src}-{tgt}"`` handle key into its parts.
 
     The last ``_`` separates the (possibly subdirectoried) shard key from the
     direction; the direction must contain ``-``. Returns ``(shard_key, direction)``
-    or ``None`` when ``relpath_no_ext`` does not match the contract.
+    or ``None`` when it does not match the contract. Operates on the basename handle
+    key (no direction folder) — for on-disk output paths use ``parse_output_relpath``.
     """
     parts = relpath_no_ext.rsplit("_", 1)
     if len(parts) == 2 and "-" in parts[1]:
         return parts[0], parts[1]
     return None
+
+
+def parse_output_relpath(relpath_no_ext: str) -> tuple[str, str] | None:
+    """Parse an on-disk output relpath (sans extension) into ``(shard_key, direction)``.
+
+    Inverse of :func:`output_paths`' layout ``"{direction}/{shard_key}_{direction}"``:
+    strip the leading ``{direction}/`` folder, parse the remaining handle key, and verify
+    the parsed direction matches the folder. Returns ``None`` for anything that doesn't
+    match (e.g. an old flat-layout file with no leading direction folder).
+    """
+    dir_part, sep, rest = relpath_no_ext.partition(os.sep)
+    if not sep:
+        return None
+    parsed = parse_handle_key(rest)
+    if parsed is None or parsed[1] != dir_part:
+        return None
+    return parsed
 
 
 # ----------------------------------------------------------------------------

@@ -60,7 +60,7 @@ from nemo_curator.stages.audio.translation.translation_utils import (
     TRANSLATE_TO_KEY,
     TRANSLATION_SKIP_KEY,
     output_paths,
-    parse_handle_key,
+    parse_output_relpath,
 )
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
@@ -184,12 +184,12 @@ def all_shards_done(manifest_path: str | list[str], output_dir: str) -> bool:
                 continue
             if fname.endswith(".jsonl.done"):
                 base = os.path.relpath(full, output_dir)[: -len(".jsonl.done")]
-                parsed = parse_handle_key(base)
+                parsed = parse_output_relpath(base)
                 if parsed is not None:
                     done_keys.add(parsed[0])
             elif fname.endswith(".jsonl"):
                 base = os.path.relpath(full, output_dir)[: -len(".jsonl")]
-                parsed = parse_handle_key(base)
+                parsed = parse_output_relpath(base)
                 if parsed is not None:
                     partial_keys.add(parsed[0])
 

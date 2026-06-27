@@ -73,6 +73,7 @@ from nemo_curator.stages.audio.translation.translation_utils import (
     handle_key,
     output_paths,
     parse_handle_key,
+    parse_output_relpath,
 )
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask
@@ -156,13 +157,15 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
                 full = os.path.join(root, fname)
                 if os.path.exists(full + ".done"):
                     continue
-                # handle_key is the path relative to output_dir (sans extension),
-                # so it carries any mirrored subdirectories from the input tree.
+                # Output relpath is "{direction}/{shard_key}_{direction}" (sans extension).
                 base = os.path.relpath(full, self.output_dir)[: -len(".jsonl")]
-                if parse_handle_key(base) is None:
-                    # Not a "{shard_key}_{src}-{tgt}.jsonl" filename — ignore.
+                parsed = parse_output_relpath(base)
+                if parsed is None:
+                    # Not a "{direction}/{shard_key}_{src}-{tgt}.jsonl" output file — ignore.
                     continue
-                recovered_key = base
+                # _seen_counts is keyed by the basename handle_key (what process_batch uses),
+                # not the on-disk relpath (which carries the leading direction folder).
+                recovered_key = handle_key(*parsed)
                 try:
                     with open(full, "rb") as f:
                         self._seen_counts[recovered_key] = sum(1 for _ in f)
