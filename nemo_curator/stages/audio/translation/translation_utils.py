@@ -260,6 +260,12 @@ def add_bitext_filter_args(parser: argparse.ArgumentParser) -> None:
         "--regex_cleanup", action="store_true",
         help="Enable regex cleanup of the translation output. (Strips non-Latin/Cyrillic/Greek scripts.)",
     )
+    regex.add_argument(
+        "--regex_num_workers", type=int, default=None,
+        help="Pin the regex-cleanup actor-pool size to run it as its OWN parallel stage "
+             "(un-fused from the single-actor writer). Default (None) keeps it a task stage. "
+             "Raise it when regex cleanup is the tail bottleneck.",
+    )
 
 
 def _candidate_langs(args: argparse.Namespace) -> list[str]:
@@ -422,7 +428,12 @@ def build_bitext_filter_stages(args: argparse.Namespace) -> list[ProcessingStage
             )
 
     if args.regex_cleanup:
-        stages.append(AudioTaskRegexModifier(field_key=_TRANSLATION_FIELD).with_(resources=cpu))
+        stages.append(
+            AudioTaskRegexModifier(
+                field_key=_TRANSLATION_FIELD,
+                num_workers_override=args.regex_num_workers,
+            ).with_(resources=cpu)
+        )
 
     # Finalize (always): normalize the translation fields for the empty-source /
     # filtered / kept cases (driven by the translation_skipme reason). Each upstream

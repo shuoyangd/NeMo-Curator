@@ -599,9 +599,26 @@ class AudioTaskRegexModifier(ProcessingStage[AudioTask, AudioTask]):
     name: str = "RegexCleanup"
     skip_key: str = WORK_SKIP_KEY
     notes_key: str = NOTES_KEY
+    num_workers_override: int | None = None
 
     def __post_init__(self) -> None:
         self._modifier = RegexSubstitutionModifier(self.regex_params)
+
+    def num_workers(self) -> int | None:
+        return self.num_workers_override
+
+    def xenna_stage_spec(self) -> dict[str, Any]:
+        spec: dict[str, Any] = {}
+        if self.num_workers_override is not None:
+            spec["num_workers"] = self.num_workers_override
+        return spec
+
+    def ray_stage_spec(self) -> dict[str, Any]:
+        # The per-row regex is stateless and CPU-bound. By default it's a task stage that Ray Data
+        # tends to FUSE into the single-actor writer -> it runs single-threaded. Pinning a worker
+        # count makes it its OWN actor pool (un-fused), so it parallelizes across CPUs while the
+        # writer stays single-actor. None -> keep the prior (task) behavior.
+        return {RayStageSpecKeys.IS_ACTOR_STAGE: True} if self.num_workers_override is not None else {}
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], [self.field_key]
