@@ -366,7 +366,12 @@ def main() -> None:
 
     t0 = time.time()
     try:
-        if all_shards_done(manifest_path=args.manifest, output_dir=args.output_dir):
+        if all_shards_done(
+            manifest_path=args.manifest,
+            output_dir=args.output_dir,
+            target_lang_codes=args.target_langs,
+            source_lang_key=args.source_lang_code_key,
+        ):
             logger.info("All shards are already complete — skipping pipeline.run().")
         else:
             if args.executor == "ray_data":
