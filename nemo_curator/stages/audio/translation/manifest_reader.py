@@ -42,7 +42,6 @@ next run the reader, after reading the manifest and computing
 
 from __future__ import annotations
 
-import glob as _glob
 import json
 import os
 from dataclasses import dataclass, field
@@ -70,31 +69,6 @@ from nemo_curator.tasks import AudioTask, FileGroupTask, _EmptyTask
 # ----------------------------------------------------------------------------
 # Pre-flight helper
 # ----------------------------------------------------------------------------
-
-
-def _resolve_input_paths(manifest_path: str | list[str]) -> list[str]:
-    """Expand a path / list-of-paths / dir / glob into a flat list of files.
-
-    Mirrors what ``FilePartitioningStage`` accepts so the pre-flight check
-    sees the same inputs that the pipeline will.  Filters to ``.jsonl`` and
-    ``.json`` extensions.
-    """
-    inputs = manifest_path if isinstance(manifest_path, list) else [manifest_path]
-    resolved: list[str] = []
-    for p in inputs:
-        if not p:
-            continue
-        if os.path.isfile(p):
-            resolved.append(p)
-        elif os.path.isdir(p):
-            for root, _dirs, files in os.walk(p):
-                for f in files:
-                    if f.endswith((".jsonl", ".json")):
-                        resolved.append(os.path.join(root, f))
-        elif any(ch in p for ch in "*?["):
-            resolved.extend(_glob.glob(p))
-        # else: missing path; ignored (pre-flight will fall back to False).
-    return resolved
 
 
 def _derive_input_root(manifest_path: str | list[str]) -> str | None:
@@ -170,82 +144,13 @@ def _row_target_codes(src_norm: str, target_codes_norm: list[str]) -> list[str]:
     Mirrors the direction rules that build ``direction_counts``: an English
     source expands to every non-English target; a source that is itself a
     configured target goes to English; anything else yields no direction.
-    Shared by :meth:`TranslationManifestReaderStage._row_targets` and the
-    :func:`all_shards_done` pre-flight so the expected direction set stays in
-    sync between the reader and the resume check.
+    Shared with :meth:`TranslationManifestReaderStage._row_targets`.
     """
     if src_norm == "en":
         return [c for c in target_codes_norm if c != "en"]
     if src_norm and src_norm in frozenset(target_codes_norm):
         return ["en"]
     return []
-
-
-def all_shards_done(
-    manifest_path: str | list[str],
-    output_dir: str,
-    target_lang_codes: list[str] | None = None,
-    source_lang_key: str = SOURCE_LANG_CODE_KEY,
-) -> bool:
-    """Pre-flight check used to skip ``pipeline.run()`` entirely on full resume.
-
-    Returns True only when **every expected ``(shard, direction)`` output has a
-    ``.jsonl.done``**. The expected directions per shard are computed exactly
-    like the reader's ``direction_counts``: each input manifest is read, and for
-    every row the source language is expanded via :func:`_row_target_codes`
-    (En->X / X->En). A shard is complete only if *all* of its expected
-    directions are ``.done`` — a partial or entirely missing direction leaves
-    its ``.done`` absent, so the check returns False and the pipeline runs,
-    letting the reader resume per direction.
-
-    This deliberately reads the manifests (only reached when ``output_dir``
-    already exists, i.e. a resume) rather than inferring completeness from the
-    output tree alone: a direction that produced no file at all — e.g. one whose
-    partial ``.jsonl`` the reader deleted before an interrupted rewrite — is
-    invisible in the output tree and would otherwise be wrongly counted as done.
-
-    Returns False when the check cannot be made confidently (missing/empty
-    inputs, no ``target_lang_codes``, or an unreadable/malformed manifest): the
-    pipeline then runs and the reader still skips completed shards correctly.
-    """
-    if not os.path.isdir(output_dir):
-        return False
-    if not target_lang_codes:
-        # Cannot compute the expected direction set without the targets.
-        return False
-
-    paths = _resolve_input_paths(manifest_path)
-    if not paths:
-        return False
-
-    target_codes_norm = [_normalize_code(c) for c in target_lang_codes]
-    input_root = _derive_input_root(manifest_path)
-
-    for path in paths:
-        shard_key = _relative_shard_key(path, input_root)
-        expected: set[str] = set()
-        try:
-            fs, resolved = url_to_fs(path)
-            with fs.open(resolved, "r", encoding="utf-8") as fh:
-                for raw_line in fh:
-                    if not raw_line.strip():
-                        continue
-                    src_raw = json.loads(raw_line.strip()).get(source_lang_key, "")
-                    src_norm = _normalize_code(src_raw) if src_raw else ""
-                    for tgt_norm in _row_target_codes(src_norm, target_codes_norm):
-                        expected.add(f"{src_norm}-{tgt_norm}")
-        except (OSError, ValueError):
-            # Unreadable / malformed manifest: cannot confirm -> run the pipeline.
-            return False
-
-        # A manifest with no translatable rows yields no output; the reader
-        # skips it too, so an empty expected set does not block completion.
-        for direction in expected:
-            _, done_path = output_paths(output_dir, shard_key, direction)
-            if not os.path.exists(done_path):
-                return False
-
-    return True
 
 
 # ----------------------------------------------------------------------------

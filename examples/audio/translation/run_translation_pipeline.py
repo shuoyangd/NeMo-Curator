@@ -103,7 +103,6 @@ from nemo_curator.stages.audio.translation import (
     TranslationExpanderStage,
     TranslationManifestReader,
     add_bitext_filter_args,
-    all_shards_done,
     build_bitext_filter_stages,
     merge_translation_cache,
 )
@@ -366,41 +365,33 @@ def main() -> None:
 
     t0 = time.time()
     try:
-        if all_shards_done(
-            manifest_path=args.manifest,
-            output_dir=args.output_dir,
-            target_lang_codes=args.target_langs,
-            source_lang_key=args.source_lang_code_key,
-        ):
-            logger.info("All shards are already complete — skipping pipeline.run().")
+        if args.executor == "ray_data":
+            # RayDataExecutor connects to the cluster SlurmRayClient bootstrapped
+            # (via RAY_ADDRESS) and ignores execution_mode — Ray Data manages its
+            # own streaming scheduling and backpressure.
+            #
+            # preserve_order=True makes outputs flow in input (manifest) order: each
+            # manifest's rows reach the directional writer together, so its .done fires
+            # before the next manifest's rows arrive. That gives incremental, durable
+            # per-manifest progress under the Slurm time limit (a partial run leaves
+            # earlier manifests .done instead of all-partial), without reloading the
+            # vLLM engine per manifest. Bounded by backpressure; costs some reorder
+            # freedom. (No effect under --executor xenna.)
+            from ray.data import DataContext
+            DataContext.get_current().execution_options.preserve_order = True
+            executor = RayDataExecutor()
         else:
-            if args.executor == "ray_data":
-                # RayDataExecutor connects to the cluster SlurmRayClient bootstrapped
-                # (via RAY_ADDRESS) and ignores execution_mode — Ray Data manages its
-                # own streaming scheduling and backpressure.
-                #
-                # preserve_order=True makes outputs flow in input (manifest) order: each
-                # manifest's rows reach the directional writer together, so its .done fires
-                # before the next manifest's rows arrive. That gives incremental, durable
-                # per-manifest progress under the Slurm time limit (a partial run leaves
-                # earlier manifests .done instead of all-partial), without reloading the
-                # vLLM engine per manifest. Bounded by backpressure; costs some reorder
-                # freedom. (No effect under --executor xenna.)
-                from ray.data import DataContext
-                DataContext.get_current().execution_options.preserve_order = True
-                executor = RayDataExecutor()
-            else:
-                executor = XennaExecutor(config={"execution_mode": args.execution_mode})
-            logger.info("Using executor: {}", type(executor).__name__)
-            pipeline.run(executor=executor)
-            logger.info("Pipeline finished in {:.1f} min.", (time.time() - t0) / 60)
+            executor = XennaExecutor(config={"execution_mode": args.execution_mode})
+        logger.info("Using executor: {}", type(executor).__name__)
+        pipeline.run(executor=executor)
+        logger.info("Pipeline finished in {:.1f} min.", (time.time() - t0) / 60)
     finally:
         if ray_client is not None:
             ray_client.stop()
 
     # Driver-side cache merge: fold every worker's per-run dump (+ the previous canonical) into one
-    # canonical file. Runs once on the driver/head, after all workers' teardown() dumps exist, and
-    # covers both the pipeline.run() path and the all_shards_done skip path. Never fails the run.
+    # canonical file. Runs once on the driver/head, after all workers' teardown() dumps exist.
+    # Never fails the run.
     if args.nmt_cache and args.nmt_cache_dir:
         try:
             n = merge_translation_cache(args.nmt_cache_dir, args.nmt_cache_max_entries)

@@ -26,7 +26,6 @@ from nemo_curator.stages.audio.translation.llm_translation import LLMTranslation
 from nemo_curator.stages.audio.translation.manifest_reader import (
     TranslationManifestReader,
     TranslationManifestReaderStage,
-    all_shards_done,
 )
 from nemo_curator.stages.audio.translation.translation_cache import (
     WorkerTranslationCache,
@@ -53,7 +52,6 @@ __all__ = [
     "TranslationManifestReaderStage",
     "WorkerTranslationCache",
     "add_bitext_filter_args",
-    "all_shards_done",
     "build_bitext_filter_stages",
     "merge_translation_cache",
 ]
