@@ -69,6 +69,7 @@ from loguru import logger
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.audio.translation.translation_utils import (
+    count_lines,
     direction_key,
     handle_key,
     output_paths,
@@ -167,8 +168,7 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
                 # not the on-disk relpath (which carries the leading direction folder).
                 recovered_key = handle_key(*parsed)
                 try:
-                    with open(full, "rb") as f:
-                        self._seen_counts[recovered_key] = sum(1 for _ in f)
+                    self._seen_counts[recovered_key] = count_lines(full)
                 except OSError as exc:
                     logger.warning(
                         "DirectionalShardedWriter: failed to recover line count for {}: {}",
@@ -253,12 +253,20 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
 
             expected = group[0]._metadata.get("direction_counts", {}).get(direction, -1)
             if expected > 0 and self._seen_counts[hkey] >= expected:
-                os.rename(out_path, done_path)
-                self._n_directions_completed += 1
-                logger.info(
-                    "DirectionalShardedWriter: direction complete -> {}",
-                    done_path,
-                )
+                # The in-memory counter can run ahead of the file when setup()
+                # seeded it from a stale partial that the reader then deleted.
+                # Verify the real on-disk line count before finalizing so we
+                # never rename a short file to .done (which would also drop the
+                # remaining rows via the done_path short-circuit above).
+                actual = count_lines(out_path)
+                self._seen_counts[hkey] = actual  # correct any drift
+                if actual >= expected:
+                    os.rename(out_path, done_path)
+                    self._n_directions_completed += 1
+                    logger.info(
+                        "DirectionalShardedWriter: direction complete -> {}",
+                        done_path,
+                    )
 
         return tasks
 

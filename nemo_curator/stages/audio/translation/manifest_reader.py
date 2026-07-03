@@ -66,6 +66,7 @@ from nemo_curator.stages.audio.translation.translation_utils import (
     SOURCE_LANG_NAME_KEY,
     TRANSLATE_TO_KEY,
     TRANSLATION_SKIP_KEY,
+    count_lines,
     output_paths,
 )
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
@@ -201,6 +202,7 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     input_skip_key: str = "_skipme"
     high_quality_key: str = "high_quality"
     input_root: str | None = None
+    verify_done_line_counts: bool = False
 
     _target_codes_norm: list[str] = field(default_factory=list, init=False, repr=False)
 
@@ -245,35 +247,17 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 logger.warning("TranslationManifestReader: empty manifest {}, skipping", manifest)
                 continue
 
-            # Resume: cache each direction's .done state so we stat it once per
-            # shard. A direction whose .jsonl.done already exists is complete and
-            # must not be re-emitted (the writer would discard it anyway, after
-            # wasting an LLM call on every row feeding it).
-            done_cache: dict[str, bool] = {}
-
-            def _direction_done(direction: str) -> bool:
-                if not self.output_dir:
-                    return False
-                if direction not in done_cache:
-                    _, done_path = output_paths(self.output_dir, shard_key, direction)
-                    done_cache[direction] = os.path.exists(done_path)
-                return done_cache[direction]
-
-            # Per-row enrichment + direction_counts in a single pass. Rows whose
-            # source language yields no valid translation direction (neither
-            # English nor a configured target) are dropped here: emitting them
-            # would push a target-less row through LLMTranslation, which skips it
-            # without writing a ``translations`` key and then fails
-            # TranslationExpander's input validation.
-            #
-            # A mixed-source manifest (e.g. some en->x rows, some x->en rows) can be
-            # partially complete on resume: some directions have a .done, others
-            # don't. We trim each row's targets to the directions still missing so
-            # only those re-run. A row whose targets are all .done is dropped
-            # entirely (never reaches the LLM), which is how a fully-done source
-            # language is skipped even when the shard as a whole isn't.
-            direction_counts: dict[str, int] = {}
-            kept_entries: list[dict[str, Any]] = []
+            # Pass 1: parse rows and build ``full_direction_counts`` — the number
+            # of rows this manifest contributes to each direction, over ALL
+            # translatable rows (independent of resume state). Rows whose source
+            # language yields no valid translation direction (neither English nor
+            # a configured target) are dropped here: emitting them would push a
+            # target-less row through LLMTranslation, which skips it without writing
+            # a ``translations`` key and then fails TranslationExpander's input
+            # validation. ``full_direction_counts[d]`` is exactly the number of
+            # output lines a complete ``.done`` for direction ``d`` must have.
+            full_direction_counts: dict[str, int] = {}
+            parsed_rows: list[tuple[dict[str, Any], str, list[str]]] = []
             for row in entries:
                 src_raw = row.get(self.source_lang_key, "")
                 src_norm = _normalize_code(src_raw) if src_raw else ""
@@ -282,12 +266,75 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 if not tgt_codes:
                     continue
 
-                pending_codes = [
-                    t for t in tgt_codes if not _direction_done(f"{src_norm}-{t}")
-                ]
+                for t in tgt_codes:
+                    key = f"{src_norm}-{t}"
+                    full_direction_counts[key] = full_direction_counts.get(key, 0) + 1
+                parsed_rows.append((row, src_norm, tgt_codes))
+
+            if not parsed_rows:
+                logger.info(
+                    "TranslationManifestReader: no translatable rows in {} "
+                    "(shard_key={}), skipping",
+                    manifest,
+                    shard_key,
+                )
+                continue
+
+            # Resume: determine which directions are already complete. A direction
+            # is done when its .jsonl.done exists; with verify_done_line_counts, the
+            # file's line count must also equal the expected row count — otherwise
+            # the .done is short/stale (e.g. left by an interrupted write or a
+            # regenerated manifest), so it is deleted and reprocessed.
+            done_dirs: set[str] = set()
+            if self.output_dir:
+                for direction, expected in full_direction_counts.items():
+                    _, done_path = output_paths(self.output_dir, shard_key, direction)
+                    if not os.path.exists(done_path):
+                        continue
+                    if self.verify_done_line_counts:
+                        try:
+                            actual = count_lines(done_path)
+                        except OSError as exc:
+                            logger.warning(
+                                "TranslationManifestReader: failed to read {}: {}; "
+                                "reprocessing",
+                                done_path,
+                                exc,
+                            )
+                            actual = -1
+                        if actual != expected:
+                            logger.warning(
+                                "TranslationManifestReader: {} has {} line(s), "
+                                "expected {}; deleting and reprocessing",
+                                done_path,
+                                actual,
+                                expected,
+                            )
+                            try:
+                                os.remove(done_path)
+                            except OSError as exc:
+                                logger.warning(
+                                    "TranslationManifestReader: failed to remove {}: {}",
+                                    done_path,
+                                    exc,
+                                )
+                            continue
+                    done_dirs.add(direction)
+
+            # Pass 2: per-row enrichment, trimming each row's targets to the
+            # directions still missing. A mixed-source manifest (e.g. some en->x
+            # rows, some x->en rows) can be partially complete on resume; a row
+            # whose targets are all done is dropped entirely (never reaches the
+            # LLM), which is how a fully-done source language is skipped even when
+            # the shard as a whole isn't.
+            direction_counts: dict[str, int] = {}
+            kept_entries: list[dict[str, Any]] = []
+            for row, src_norm, tgt_codes in parsed_rows:
+                pending_codes = [t for t in tgt_codes if f"{src_norm}-{t}" not in done_dirs]
                 if not pending_codes:
                     continue
 
+                src_raw = row.get(self.source_lang_key, "")
                 if src_raw:
                     row[self.source_lang_name_key] = lang_code_to_name(src_raw)
                 # Canonicalize the source-lang code into a fixed key so downstream
@@ -402,6 +449,10 @@ class TranslationManifestReader(CompositeStage[_EmptyTask, AudioTask]):
                               name into (default: ``"source_lang_name"``).
         translate_to_key:     Row key to write the per-row list of target
                               display names into (default: ``"translate_to"``).
+        verify_done_line_counts: When True, validate each existing ``.jsonl.done``
+                              on resume by comparing its line count to the expected
+                              row count; a mismatch (short/stale file) is deleted
+                              and reprocessed (default: ``False`` — existence-only).
         files_per_partition:  Files per ``FilePartitioningStage`` partition
                               (default: ``1`` — one manifest per partition,
                               which makes shard == file).
@@ -419,6 +470,7 @@ class TranslationManifestReader(CompositeStage[_EmptyTask, AudioTask]):
     translate_to_key: str = TRANSLATE_TO_KEY
     input_skip_key: str = "_skipme"
     high_quality_key: str = "high_quality"
+    verify_done_line_counts: bool = False
     files_per_partition: int | None = 1
     file_extensions: list[str] | None = None
     storage_options: dict[str, Any] | None = None
@@ -451,6 +503,7 @@ class TranslationManifestReader(CompositeStage[_EmptyTask, AudioTask]):
                 translate_to_key=self.translate_to_key,
                 input_skip_key=self.input_skip_key,
                 high_quality_key=self.high_quality_key,
+                verify_done_line_counts=self.verify_done_line_counts,
                 input_root=_derive_input_root(self.manifest_path),
             ),
         ]

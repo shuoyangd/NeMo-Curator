@@ -74,6 +74,17 @@ TRANSLATE_TO_KEY = "translate_to"
 TRANSLATIONS_KEY = "translations"
 
 
+def count_lines(path: str) -> int:
+    """Count newline-terminated lines in a file (binary read, fast).
+
+    Shared by the writer (partial-count recovery + completion check) and the
+    reader (``.done`` validation) so the per-direction line accounting cannot
+    drift between the two stages.
+    """
+    with open(path, "rb") as f:
+        return sum(1 for _ in f)
+
+
 def direction_key(src_code: str, tgt_code: str) -> str:
     """Build the normalised ``"{src}-{tgt}"`` direction key (e.g. ``"en-de"``)."""
     return f"{_normalize_code(src_code)}-{_normalize_code(tgt_code)}"

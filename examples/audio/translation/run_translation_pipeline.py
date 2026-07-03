@@ -149,6 +149,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="source_lang",
         help="Input manifest key holding the source language ISO code.",
     )
+    ap.add_argument(
+        "--verify_done_line_counts",
+        action="store_true",
+        help=(
+            "On resume, validate each existing .jsonl.done by comparing its line count to the "
+            "expected row count; a mismatch (short/stale file) is deleted and reprocessed. Adds "
+            "read I/O per resume; default off (existence-only check)."
+        ),
+    )
 
     # ------------------------------------------------------------ Translation (NMT) model
     # All translation-stage knobs are prefixed --nmt_* to mark them as LLMTranslationStage config.
@@ -336,6 +345,7 @@ def main() -> None:
             source_lang_key=args.source_lang_code_key,
             input_skip_key=args.skip_me_key,
             high_quality_key=args.high_quality_key,
+            verify_done_line_counts=args.verify_done_line_counts,
         ),
         translate_stage,
         TranslationExpanderStage(
