@@ -29,15 +29,22 @@ writer materialises one output file per ``(shard_key, direction)`` pair at
 
 Resume semantics
 ----------------
-A shard is fully done when every direction in ``direction_counts`` for that
-shard has a corresponding ``.jsonl.done`` file in ``output_dir``.  On the
-next run the reader, after reading the manifest and computing
-``direction_counts``:
+Completion is tracked per ``(shard, direction)``: a direction is done when its
+``.jsonl.done`` file exists in ``output_dir``.  A manifest with multiple source
+languages produces multiple directions (e.g. ``en-de``/``en-fr`` from English
+rows, ``fr-en`` from French rows) that can complete independently, so the reader
+resumes at direction granularity.  For each row it drops the target directions
+that are already ``.done`` and only emits the pending ones; a row whose targets
+are all done is skipped entirely (never reaching the LLM).  Consequences:
 
-  * skips the whole file if all expected ``.done`` files are present, or
-  * deletes any partial ``{shard_key}_{src}-{tgt}.jsonl`` (no ``.done``
-    sibling) for an expected direction, then re-emits all rows so the
-    writer's append mode starts from a clean slate.
+  * a source language whose every direction is ``.done`` is skipped even when
+    other directions in the same shard are still missing (and the whole file is
+    skipped when nothing is left to translate);
+  * a partially-done row keeps only its missing targets in ``translate_to`` /
+    ``direction_counts``, so the LLM does not re-translate finished directions;
+  * any partial ``{shard_key}_{src}-{tgt}.jsonl`` (no ``.done`` sibling) for a
+    pending direction is deleted before re-emitting, so the writer's append mode
+    starts from a clean slate.
 """
 
 from __future__ import annotations
@@ -166,20 +173,22 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
       * ``source_lang_name`` — display name resolved from the row's
         ``source_lang`` code via ``LANGUAGE_MAP``.
       * ``translate_to``    — list of target display names per the
-        direction rules (En -> X, X -> En only).
+        direction rules (En -> X, X -> En only), trimmed to directions that are
+        not yet ``.done`` on resume.
 
     Each emitted ``AudioTask`` carries:
       * ``_metadata["_shard_key"]``       — manifest path relative to the input
         root, extension stripped (subdirectories preserved); the bare stem when
         input is flat.
-      * ``_metadata["_shard_total"]``     — total non-empty lines.
-      * ``_metadata["direction_counts"]`` — dict ``"{src}-{tgt}" -> int``
-        the writer uses to know when each direction is complete.
+      * ``_metadata["_shard_total"]``     — number of emitted (non-skipped) rows.
+      * ``_metadata["direction_counts"]`` — dict ``"{src}-{tgt}" -> int`` (pending
+        directions only) the writer uses to know when each direction is complete.
 
-    Resume:
-      * if every expected direction's ``.jsonl.done`` exists, the whole
-        shard is skipped;
-      * any partial ``.jsonl`` for an expected direction is deleted before
+    Resume (per ``(shard, direction)``):
+      * each row's targets are trimmed to directions whose ``.jsonl.done`` does
+        not yet exist; a row with no pending targets is not emitted, so a
+        fully-done source language (or the whole shard) is skipped;
+      * any partial ``.jsonl`` for a pending direction is deleted before
         re-emitting rows (writer appends, so clean slate is required).
     """
 
@@ -194,9 +203,6 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     input_root: str | None = None
 
     _target_codes_norm: list[str] = field(default_factory=list, init=False, repr=False)
-    _target_set: frozenset[str] = field(default_factory=frozenset, init=False, repr=False)
-    _en_to_x_codes: list[str] = field(default_factory=list, init=False, repr=False)
-    _en_to_x_names: list[str] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.target_lang_codes:
@@ -204,20 +210,13 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             raise ValueError(msg)
 
         self._target_codes_norm = [_normalize_code(c) for c in self.target_lang_codes]
-        self._target_set = frozenset(self._target_codes_norm)
-        self._en_to_x_codes = [c for c in self._target_codes_norm if c != "en"]
-        # Fails loudly if a configured target code is not in LANGUAGE_MAP.
-        self._en_to_x_names = [LANGUAGE_MAP[c] for c in self._en_to_x_codes]
+        # Fails loudly up-front if a configured target code is not in LANGUAGE_MAP
+        # (the per-row translate_to build resolves display names via LANGUAGE_MAP).
+        for c in self._target_codes_norm:
+            _ = LANGUAGE_MAP[c]
 
     def _row_targets(self, src_norm: str) -> list[str]:
         return _row_target_codes(src_norm, self._target_codes_norm)
-
-    def _row_target_names(self, src_norm: str) -> list[str]:
-        if src_norm == "en":
-            return list(self._en_to_x_names)
-        if src_norm and src_norm in self._target_set:
-            return [LANGUAGE_MAP["en"]]
-        return []
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
@@ -246,20 +245,47 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 logger.warning("TranslationManifestReader: empty manifest {}, skipping", manifest)
                 continue
 
+            # Resume: cache each direction's .done state so we stat it once per
+            # shard. A direction whose .jsonl.done already exists is complete and
+            # must not be re-emitted (the writer would discard it anyway, after
+            # wasting an LLM call on every row feeding it).
+            done_cache: dict[str, bool] = {}
+
+            def _direction_done(direction: str) -> bool:
+                if not self.output_dir:
+                    return False
+                if direction not in done_cache:
+                    _, done_path = output_paths(self.output_dir, shard_key, direction)
+                    done_cache[direction] = os.path.exists(done_path)
+                return done_cache[direction]
+
             # Per-row enrichment + direction_counts in a single pass. Rows whose
             # source language yields no valid translation direction (neither
             # English nor a configured target) are dropped here: emitting them
             # would push a target-less row through LLMTranslation, which skips it
             # without writing a ``translations`` key and then fails
             # TranslationExpander's input validation.
+            #
+            # A mixed-source manifest (e.g. some en->x rows, some x->en rows) can be
+            # partially complete on resume: some directions have a .done, others
+            # don't. We trim each row's targets to the directions still missing so
+            # only those re-run. A row whose targets are all .done is dropped
+            # entirely (never reaches the LLM), which is how a fully-done source
+            # language is skipped even when the shard as a whole isn't.
             direction_counts: dict[str, int] = {}
             kept_entries: list[dict[str, Any]] = []
             for row in entries:
                 src_raw = row.get(self.source_lang_key, "")
                 src_norm = _normalize_code(src_raw) if src_raw else ""
 
-                target_names = self._row_target_names(src_norm)
-                if not target_names:
+                tgt_codes = self._row_targets(src_norm)
+                if not tgt_codes:
+                    continue
+
+                pending_codes = [
+                    t for t in tgt_codes if not _direction_done(f"{src_norm}-{t}")
+                ]
+                if not pending_codes:
                     continue
 
                 if src_raw:
@@ -279,9 +305,13 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 # and a "skipped: low_quality" note. Only fills an empty gate (input _skipme wins).
                 if not row[TRANSLATION_SKIP_KEY] and _is_low_quality(row.get(self.high_quality_key)):
                     row[TRANSLATION_SKIP_KEY] = LOW_QUALITY_REASON
-                row[self.translate_to_key] = target_names
+                # translate_to (and direction_counts below) are trimmed to the
+                # pending directions only. The LLM stage fans out over exactly
+                # translate_to, so the writer receives direction_counts[d] rows
+                # per direction d, keeping its completion count exact.
+                row[self.translate_to_key] = [LANGUAGE_MAP[t] for t in pending_codes]
 
-                for tgt_norm in self._row_targets(src_norm):
+                for tgt_norm in pending_codes:
                     key = f"{src_norm}-{tgt_norm}"
                     direction_counts[key] = direction_counts.get(key, 0) + 1
 
@@ -289,32 +319,20 @@ class TranslationManifestReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
             if not kept_entries:
                 logger.info(
-                    "TranslationManifestReader: no translatable rows in {} "
-                    "(shard_key={}), skipping",
+                    "TranslationManifestReader: nothing to translate in {} "
+                    "(shard_key={}) — all directions .done or no translatable rows, "
+                    "skipping",
                     manifest,
                     shard_key,
                 )
                 continue
 
-            # Resume: skip whole shard if every expected direction is .done.
-            # Otherwise delete any partial .jsonl (no .done sibling) so the
-            # writer's append mode starts from a clean slate.
-            if self.output_dir and direction_counts:
-                direction_files = {
-                    d: output_paths(self.output_dir, shard_key, d) for d in direction_counts
-                }
-                if all(os.path.exists(done) for _, done in direction_files.values()):
-                    logger.info(
-                        "TranslationManifestReader: skipping completed shard {} "
-                        "({} direction(s) all .done)",
-                        shard_key,
-                        len(direction_files),
-                    )
-                    continue
-
-                for partial, done_path in direction_files.values():
-                    if os.path.exists(done_path):
-                        continue
+            # Delete any partial .jsonl (no .done sibling) for the directions we are
+            # about to (re-)write, so the writer's append mode starts from a clean
+            # slate. Every direction in direction_counts is not-done by construction.
+            if self.output_dir:
+                for direction in direction_counts:
+                    partial, _ = output_paths(self.output_dir, shard_key, direction)
                     if os.path.exists(partial):
                         try:
                             os.remove(partial)
